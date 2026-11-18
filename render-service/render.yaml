@@ -1,0 +1,22 @@
+# Render "Blueprint" spec — optional, but makes the deploy config explicit
+# and reproducible instead of relying on dashboard clicks alone. If you
+# connect the repo through Render's dashboard without using this file,
+# just set "Root Directory" to render-service manually (see deploy steps).
+services:
+  - type: web
+    name: company-scrapper-service
+    runtime: node
+    rootDir: render-service
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: MISTRAL_MODEL
+        value: mistral-small-latest
+      - key: INGEST_SECRET
+        sync: false

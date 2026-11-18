@@ -1,0 +1,20 @@
+{
+  "name": "company-scrapper-service",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Always-on API for the Researchers/Company Scrapper AI — reads/writes the live Supabase business store, exposes trade-area search, and handles natural-language research requests via Mistral (no GPU needed, unlike the Kaggle-side model).",
+  "type": "commonjs",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.1"
+  }
+}

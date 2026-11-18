@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Company Scrapper — Live</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 860px;
+         margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+  h1 { font-size: 1.6rem; margin-bottom: 4px; }
+  .sub { color: #777; margin-top: 0; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 12px; margin: 24px 0; }
+  .stat { border: 1px solid #ddd; border-radius: 10px; padding: 16px; text-align: center; }
+  .stat .n { font-size: 1.8rem; font-weight: 700; display: block; }
+  .stat .l { font-size: 0.85rem; color: #777; }
+  form { display: flex; gap: 8px; margin: 24px 0; flex-wrap: wrap; }
+  input[type=text] { flex: 1; min-width: 240px; padding: 10px 12px; border-radius: 8px;
+                      border: 1px solid #ccc; font-size: 1rem; }
+  button { padding: 10px 18px; border-radius: 8px; border: none; background: #222;
+           color: #fff; font-size: 1rem; cursor: pointer; }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #result { white-space: pre-wrap; background: #f6f6f6; border-radius: 10px; padding: 16px;
+             font-size: 0.9rem; display: none; }
+  #error { color: #b00020; display: none; margin: 12px 0; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+  @media (prefers-color-scheme: dark) {
+    .stat { border-color: #333; } th, td { border-color: #333; }
+    #result { background: #1b1b1b; }
+  }
+</style>
+</head>
+<body>
+  <h1>Company Scrapper</h1>
+  <p class="sub">Live view of the Researchers category's always-on business discovery AI.</p>
+
+  <div class="stats" id="stats">
+    <div class="stat"><span class="n">—</span><span class="l">businesses tracked</span></div>
+    <div class="stat"><span class="n">—</span><span class="l">no website</span></div>
+    <div class="stat"><span class="n">—</span><span class="l">categories</span></div>
+    <div class="stat"><span class="n">—</span><span class="l">last updated</span></div>
+  </div>
+
+  <form id="research-form">
+    <input type="text" id="request" placeholder='e.g. "dental clinics with no website within 3 miles of 123 Main St, Columbus, OH"' />
+    <button type="submit">Research</button>
+  </form>
+  <div id="error"></div>
+  <div id="result"></div>
+
+  <script>
+    // Update this if the Render service's URL ever changes.
+    const API_BASE = "https://aicompany-a5qc.onrender.com";
+
+    async function loadStats() {
+      try {
+        const res = await fetch(`${API_BASE}/api/stats`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const s = await res.json();
+        const cards = document.querySelectorAll("#stats .stat");
+        cards[0].querySelector(".n").textContent = (s.total_businesses ?? 0).toLocaleString();
+        cards[1].querySelector(".n").textContent = (s.no_website_count ?? 0).toLocaleString();
+        cards[2].querySelector(".n").textContent = (s.distinct_categories ?? 0).toLocaleString();
+        cards[3].querySelector(".n").textContent = s.last_updated
+          ? new Date(s.last_updated).toLocaleString() : "—";
+      } catch (e) {
+        document.getElementById("error").textContent =
+          `Couldn't reach the live service right now (${e.message}). It may still be waking up — try again in a few seconds.`;
+        document.getElementById("error").style.display = "block";
+      }
+    }
+
+    function renderResult(data) {
+      const errEl = document.getElementById("error");
+      const resEl = document.getElementById("result");
+      errEl.style.display = "none";
+      resEl.style.display = "block";
+
+      if (data.error) {
+        resEl.style.display = "none";
+        errEl.textContent = data.error;
+        errEl.style.display = "block";
+        return;
+      }
+
+      const s = data.summary || {};
+      let html = `<strong>${s.competitor_count ?? data.businesses.length} competitors found</strong>`;
+      html += ` (${s.no_website_count ?? "?"} with no website)`;
+      if (s.nearest_miles != null) html += ` — nearest ${Number(s.nearest_miles).toFixed(2)} mi away`;
+      html += `<br>Matched categories: ${data.matched_categories.join(", ")}<br><br>`;
+
+      if (data.businesses && data.businesses.length) {
+        html += "<table><tr><th>Name</th><th>Category</th><th>City</th><th>Website</th></tr>";
+        for (const b of data.businesses.slice(0, 50)) {
+          html += `<tr><td>${b.name || ""}</td><td>${b.category || ""}</td><td>${b.city || ""}</td>`
+                + `<td>${b.website || "—"}</td></tr>`;
+        }
+        html += "</table>";
+        if (data.businesses.length > 50) html += `<p>...and ${data.businesses.length - 50} more.</p>`;
+      }
+      resEl.innerHTML = html;
+    }
+
+    document.getElementById("research-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = e.target.querySelector("button");
+      const req = document.getElementById("request").value.trim();
+      if (!req) return;
+      btn.disabled = true;
+      btn.textContent = "Searching...";
+      document.getElementById("error").style.display = "none";
+      document.getElementById("result").style.display = "none";
+      try {
+        const res = await fetch(`${API_BASE}/api/research`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request: req }),
+        });
+        const data = await res.json();
+        renderResult(data);
+      } catch (err) {
+        document.getElementById("error").textContent = `Request failed: ${err.message}`;
+        document.getElementById("error").style.display = "block";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Research";
+      }
+    });
+
+    loadStats();
+  </script>
+</body>
+</html>
