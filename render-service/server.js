@@ -5,7 +5,6 @@ const express = require("express");
 const cors = require("cors");
 
 const { supabase } = require("./lib/supabase");
-const { parseResearchRequest, matchCategories } = require("./lib/mistral");
 const { getRealCategories, closeMatches } = require("./lib/categories");
 const { geocodeAddress } = require("./lib/geocode");
 
@@ -116,69 +115,58 @@ app.get("/api/trade-area", async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// Natural-language research request -> real structured query -> real
-// results. The on-demand equivalent of company_scrapper_ai.py's research(),
-// ported to Mistral since this runs on Render (no GPU) instead of a Kaggle
-// GPU notebook. Every field either came from the user's own words or was
-// validated against real data (real geocode, real category match, real
-// row counts from Supabase) — nothing here is invented to fill a gap.
+// Research: structured fields in (address, category, radius, no-website
+// toggle) -> real query out. Deliberately NO LLM call anywhere in this
+// path — no external model API, no local Qwen, nothing. There's no reason to pay for or run
+// a model just to split "dental clinics near 123 Main St" into its parts
+// when a form with separate fields gets the same parts for free. Geocoding
+// is real (Nominatim), and category matching is real (fuzzy string match
+// against the LIVE distinct category list in Supabase, lib/categories.js)
+// — both deterministic, both verifiable, neither one guessing.
+//
+// The actual trained template model (your own AI, no third party) still
+// does real natural-language understanding for deep on-demand sessions —
+// that's company_scrapper_ai.py, run on Kaggle's free GPU, which is where
+// inference on a 7B model actually belongs. Render has no GPU, so it was
+// never going to run that model directly; the fix for that constraint is
+// "don't need a model here at all," not "call someone else's model."
 // ---------------------------------------------------------------------
-const _researchRateLimiter = new Map(); // ip -> [timestamps] — cheap guard since this calls a paid API
-function rateLimited(ip, maxPerMinute = 10) {
-  const now = Date.now();
-  const hits = (_researchRateLimiter.get(ip) || []).filter((t) => now - t < 60_000);
-  hits.push(now);
-  _researchRateLimiter.set(ip, hits);
-  return hits.length > maxPerMinute;
-}
-
 app.post("/api/research", async (req, res) => {
   try {
-    if (rateLimited(req.ip)) {
-      return res.status(429).json({ error: "Too many research requests from this IP — slow down." });
+    const { address, category, radius_miles, no_website_only, country } = req.body || {};
+    if (!address || typeof address !== "string") {
+      return res.status(400).json({ error: "Body must include 'address' (a real street address or place name)." });
     }
-    const { request: nlRequest, output_formats } = req.body || {};
-    if (!nlRequest || typeof nlRequest !== "string") {
-      return res.status(400).json({ error: "Body must include 'request': the plain-English research request." });
-    }
-
-    const parsed = await parseResearchRequest(nlRequest);
-    if (!parsed.address) {
-      return res.status(422).json({
-        error: "Could not find a location to anchor the trade area in that request — "
-          + "ask for a specific address rather than guessing one.",
-        parsed,
-      });
+    if (!category || typeof category !== "string") {
+      return res.status(400).json({ error: "Body must include 'category' (e.g. 'dental clinic', 'coffee shop')." });
     }
 
-    const { lat, lon } = await geocodeAddress(parsed.address);
+    const { lat, lon } = await geocodeAddress(address);
 
     const realCategories = await getRealCategories();
-    const shortlist = closeMatches(parsed.category || "", realCategories);
-    const categories = await matchCategories(parsed.category || "", realCategories, shortlist);
+    const categories = closeMatches(category, realCategories);
     if (categories.length === 0) {
       return res.status(422).json({
-        error: `Could not match "${parsed.category}" to any real category in the live database — `
-          + `ask the user to clarify rather than searching everything.`,
-        parsed,
+        error: `Could not match "${category}" to any real category in the live database — `
+          + `try a different or more specific term rather than searching everything.`,
+        real_category_sample: realCategories.slice(0, 20),
       });
     }
 
-    const radiusMiles = parsed.radius_miles || 3;
+    const radiusMiles = Number(radius_miles) > 0 ? Number(radius_miles) : 3;
     const { data: summaryRows, error: e1 } = await supabase.rpc("businesses_trade_area_summary", {
       center_lat: lat, center_lon: lon, radius_miles: radiusMiles,
-      categories, country_filter: parsed.country || null,
+      categories, country_filter: country || null,
     });
     if (e1) throw e1;
     const { data: businesses, error: e2 } = await supabase.rpc("businesses_within_radius", {
       center_lat: lat, center_lon: lon, radius_miles: radiusMiles,
-      categories, only_no_website: !!parsed.no_website_only, country_filter: parsed.country || null,
+      categories, only_no_website: !!no_website_only, country_filter: country || null,
     });
     if (e2) throw e2;
 
     res.json({
-      request: nlRequest,
-      parsed,
+      address, category,
       matched_categories: categories,
       center: { lat, lon },
       radius_miles: radiusMiles,
