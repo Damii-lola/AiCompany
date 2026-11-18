@@ -37,6 +37,7 @@ DUCKDB_MEMORY_LIMIT, MIN_CONFIDENCE, SCAN_IDLE_SLEEP_SECONDS,
 INGEST_BATCH_SIZE.
 """
 
+import sys
 import os
 import json
 import time
@@ -44,6 +45,15 @@ from datetime import datetime, timezone
 
 import duckdb
 import requests
+
+# Render's log stream isn't a real terminal, so Python block-buffers stdout
+# by default instead of flushing per-line — print() output can sit
+# invisible in the buffer for a long time (a crash on stderr would still
+# show up, since stderr is unbuffered by default; this is specifically
+# about stdout going quiet with no sign of a crash). Force line buffering
+# here so every print() below actually reaches the Render log in real time,
+# instead of relying on the service's Start Command including "python -u".
+sys.stdout.reconfigure(line_buffering=True)
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
