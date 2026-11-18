@@ -1,0 +1,3 @@
+# Real env files with real secrets live only on the VM, never in git.
+*.env
+!*.env.example
