@@ -58,12 +58,23 @@ sys.stdout.reconfigure(line_buffering=True)
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
-TILE_DEG = int(os.environ.get("TILE_DEG", "10"))  # smaller than the old Kaggle version's 15 —
-                                                     # keeps each tile's memory footprint modest
-                                                     # for a modest Render worker plan's RAM
+# A fixed tile size can never be "safe" everywhere — a 2-degree box over
+# open ocean and a 2-degree box over Lagos or Manhattan are wildly
+# different workloads. So TILE_DEG only sets the STARTING grid; any
+# individual region that still blows memory gets automatically quartered
+# and retried (see scan_region below) rather than this constant needing to
+# be tuned down to whatever the single densest spot on Earth requires.
+TILE_DEG = int(os.environ.get("TILE_DEG", "2"))
+MIN_SPLIT_DEG = float(os.environ.get("MIN_SPLIT_DEG", "0.1"))  # stop subdividing below this size
+MAX_SPLIT_DEPTH = int(os.environ.get("MAX_SPLIT_DEPTH", "8"))
 MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.0"))
-THREADS = int(os.environ.get("DUCKDB_THREADS", "2"))
-MEMORY_LIMIT = os.environ.get("DUCKDB_MEMORY_LIMIT", "1536MB")
+THREADS = int(os.environ.get("DUCKDB_THREADS", "1"))
+# Conservative default for Render's base 512MB worker tier: DuckDB's
+# memory_limit only bounds its own buffer manager, not the Python process
+# as a whole (pandas/pyarrow materialization of a fetched result lives
+# outside that accounting), so this is set well under the box's real RAM
+# rather than right up against it. Raise it if you're on a bigger plan.
+MEMORY_LIMIT = os.environ.get("DUCKDB_MEMORY_LIMIT", "300MB")
 SCAN_IDLE_SLEEP_SECONDS = int(os.environ.get("SCAN_IDLE_SLEEP_SECONDS", str(6 * 3600)))
 INGEST_BATCH_SIZE = int(os.environ.get("INGEST_BATCH_SIZE", "500"))
 FALLBACK_RELEASE = "2026-10-21.0"  # only used if the live STAC lookup fails
@@ -137,6 +148,41 @@ def _pick(cols, *candidates):
     return "NULL"
 
 
+def scan_region(con, select, cols, x0, y0, x1, y1, depth=0):
+    """Queries one lon/lat bounding box. If it fails (almost always an OOM
+    on a dense region at this process's memory budget, though any
+    exception triggers the same recovery), and the box is still bigger
+    than MIN_SPLIT_DEG and we haven't hit MAX_SPLIT_DEPTH, it quarters the
+    box and recurses on each quadrant instead of giving up or silently
+    using a bigger memory_limit than the box actually has. Returns the
+    real row count found (0 is a legitimate, honest answer for an empty
+    region like open ocean — it is never used to mean 'failed')."""
+    where = f"bbox.xmin >= {x0} AND bbox.xmin < {x1} AND bbox.ymin >= {y0} AND bbox.ymin < {y1}"
+    if "confidence" in cols and MIN_CONFIDENCE > 0:
+        where += f" AND confidence >= {MIN_CONFIDENCE}"
+    try:
+        df = con.execute(f"SELECT {select} FROM places WHERE {where}").fetchdf()
+        n = len(df)
+        if n > 0:
+            records = json.loads(df.to_json(orient="records"))  # NaN -> real null, safely
+            supabase_upsert_businesses(records)
+        return n
+    except Exception as e:
+        width = x1 - x0
+        if depth >= MAX_SPLIT_DEPTH or width <= MIN_SPLIT_DEG:
+            print(f"    region ({x0:.3f},{y0:.3f})-({x1:.3f},{y1:.3f}) still failing at the smallest "
+                  f"split size ({width:.3f} deg, depth {depth}): {e}")
+            raise
+        mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+        print(f"    region ({x0:.3f},{y0:.3f})-({x1:.3f},{y1:.3f}) failed ({type(e).__name__}: {e}) "
+              f"— splitting into 4 quadrants (depth {depth + 1}) and retrying each")
+        total = 0
+        for (sx0, sy0, sx1, sy1) in [(x0, y0, mx, my), (mx, y0, x1, my),
+                                      (x0, my, mx, y1), (mx, my, x1, y1)]:
+            total += scan_region(con, select, cols, sx0, sy0, sx1, sy1, depth + 1)
+        return total
+
+
 def run_one_pass(release):
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -177,28 +223,19 @@ def run_one_pass(release):
             continue
         did_any_work = True
 
-        where = (f"bbox.xmin >= {x} AND bbox.xmin < {x + TILE_DEG} "
-                 f"AND bbox.ymin >= {y} AND bbox.ymin < {y + TILE_DEG}")
-        if "confidence" in cols and MIN_CONFIDENCE > 0:
-            where += f" AND confidence >= {MIN_CONFIDENCE}"
-
-        df = None
-        for attempt in range(4):
+        n = None
+        for attempt in range(3):
             try:
-                df = con.execute(f"SELECT {select} FROM places WHERE {where}").fetchdf()
+                n = scan_region(con, select, cols, x, y, x + TILE_DEG, y + TILE_DEG)
                 break
             except Exception as e:
-                print(f"  tile {tile_key} attempt {attempt + 1}/4 failed: {e}")
+                print(f"  tile {tile_key} attempt {attempt + 1}/3 failed even after splitting: {e}")
                 time.sleep(5 * (attempt + 1))
-        if df is None:
-            print(f"  SKIPPED {tile_key} after 4 failed attempts — "
+        if n is None:
+            print(f"  SKIPPED {tile_key} after 3 failed attempts — "
                   f"not marked done, will retry on a later loop iteration.")
             continue
 
-        n = len(df)
-        if n > 0:
-            records = json.loads(df.to_json(orient="records"))  # NaN -> real null, safely
-            supabase_upsert_businesses(records)
         supabase_mark_tile_done(tile_key, release, n)
         print(f"[{i}/{len(tiles)}] tile {tile_key}: {n:,} rows synced to Supabase")
 
