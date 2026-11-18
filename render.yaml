@@ -1,0 +1,42 @@
+# Render Blueprint — documents the full two-service setup. Since
+# render-service was already created manually in the Render dashboard
+# (not via Blueprint sync), don't run "New -> Blueprint" from this file —
+# it may try to stand up a SEPARATE service from the one you already have.
+# Instead, create scanner-service by hand too: dashboard -> New ->
+# Background Worker, same rootDir/build/start/env values as below. This
+# file exists as the single source of truth for those values, not as
+# something Render auto-applies here.
+services:
+  - type: web
+    name: company-scrapper-service
+    runtime: node
+    rootDir: render-service
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: INGEST_SECRET
+        sync: false
+
+  - type: worker
+    name: company-scrapper-scanner
+    runtime: python
+    rootDir: scanner-service
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scan_worker.py
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: TILE_DEG
+        value: "10"
+      - key: DUCKDB_THREADS
+        value: "2"
+      - key: DUCKDB_MEMORY_LIMIT
+        value: "1536MB"
+      - key: SCAN_IDLE_SLEEP_SECONDS
+        value: "21600"

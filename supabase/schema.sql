@@ -86,3 +86,17 @@ create or replace function businesses_trade_area_summary(
     and (categories is null or category = any(categories))
     and (country_filter is null or country = country_filter);
 $$ language sql stable;
+
+-- Scan progress — lets the scanner (now a Render background worker, not a
+-- Kaggle notebook) be fully stateless on local disk. tile_key is scoped by
+-- release ("2026-10-21.0:-180_-90") so a newer Overture release's tiles are
+-- automatically "not done" with no reset/clear step ever needed — old
+-- releases' rows just sit here harmlessly (a few thousand tiny rows per
+-- release, trivial for Postgres).
+create table if not exists scan_tiles (
+  tile_key    text primary key,
+  release     text not null,
+  rows_found  integer not null default 0,
+  scanned_at  timestamptz not null default now()
+);
+create index if not exists idx_scan_tiles_release on scan_tiles (release);
