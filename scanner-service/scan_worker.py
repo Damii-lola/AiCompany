@@ -183,7 +183,7 @@ def scan_region(con, select, cols, x0, y0, x1, y1, depth=0):
         return total
 
 
-def run_one_pass(release):
+def run_one_pass(release, deadline=None):
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("SET s3_region='us-west-2';")
@@ -218,6 +218,11 @@ def run_one_pass(release):
     did_any_work = False
 
     for i, (x, y) in enumerate(tiles, 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"  runtime cap reached mid-pass at tile {i}/{len(tiles)} — stopping here, "
+                  f"cleanly, nothing lost (unprocessed tiles just aren't marked done yet).")
+            break
+
         tile_key = f"{release}:{x}_{y}"
         if supabase_tile_done(tile_key):
             continue
@@ -244,27 +249,59 @@ def run_one_pass(release):
 
 
 def main():
-    print("Company Scrapper scan worker starting — Render background worker, "
-          "no GPU required, no local disk state kept.")
+    # MAX_RUNTIME_SECONDS is for a bounded host that re-triggers this
+    # process on its own schedule instead of letting it run forever — a
+    # GitHub Actions job (6-hour hard cap per job) being the real case this
+    # was added for. When it's set, the loop exits cleanly well before that
+    # cap instead of sleeping (sleeping would just burn the job's time
+    # budget doing nothing); the next scheduled workflow run is what makes
+    # this "continuous" there, the same role SCAN_IDLE_SLEEP_SECONDS plays
+    # on a host that stays up by itself (Render, a VM). Unset (the default)
+    # means run forever, unchanged from before.
+    max_runtime = os.environ.get("MAX_RUNTIME_SECONDS")
+    deadline = time.monotonic() + int(max_runtime) if max_runtime else None
+
+    print("Company Scrapper scan worker starting — no GPU required, no local disk state kept."
+          + (f" Bounded run: exiting by ~{int(max_runtime)}s from now." if deadline else " Running indefinitely."))
+
     while True:
+        if deadline and time.monotonic() >= deadline:
+            print("MAX_RUNTIME_SECONDS reached — exiting cleanly so the scheduler can re-trigger. "
+                  "Nothing lost: progress lives in Supabase's scan_tiles table, not in this process.")
+            return
+
         release = latest_release()
         try:
-            did_work = run_one_pass(release)
+            did_work = run_one_pass(release, deadline)
         except Exception as e:
-            # Never let one bad pass kill the worker forever — Render will
-            # restart on a hard crash anyway, but a transient S3/network
-            # blip shouldn't require manual intervention.
+            # Never let one bad pass kill the worker forever — the host
+            # (Render, a VM) will restart on a hard crash anyway, but a
+            # transient S3/network blip shouldn't require manual
+            # intervention. Under a runtime cap, respect it here too rather
+            # than sleeping past the deadline.
             print(f"Pass against {release} failed with an unhandled error: {e}. Retrying in 5 minutes.")
-            time.sleep(300)
+            _sleep_respecting_deadline(300, deadline)
             continue
 
         if not did_work:
+            if deadline:
+                print(f"Full pass against release {release} already complete — "
+                      f"nothing left to do this run, exiting cleanly.")
+                return
             print(f"Full pass against release {release} already complete. "
                   f"Sleeping {SCAN_IDLE_SLEEP_SECONDS}s, then checking for a newer release...")
             time.sleep(SCAN_IDLE_SLEEP_SECONDS)
         # loop again regardless — either there's leftover work (retried
         # tiles from a prior failure) or we just finished sleeping and
         # latest_release() may now return something new
+
+
+def _sleep_respecting_deadline(seconds, deadline):
+    if deadline is None:
+        time.sleep(seconds)
+        return
+    remaining = deadline - time.monotonic()
+    time.sleep(max(0, min(seconds, remaining)))
 
 
 if __name__ == "__main__":
