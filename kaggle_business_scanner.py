@@ -84,22 +84,22 @@ def push_single_file(local_path, slug, title, note):
     os.link(local_path, link)
     return push_dataset(up, slug, title, note)
 
-# %% Real-time ingest into Supabase, via the Render service — the "constantly
-# updating itself" step. Supabase credentials never touch this notebook at
+# %% Real-time ingest into Prisma Postgres, via the Render service — the "constantly
+# updating itself" step. Database credentials never touch this notebook at
 # all (only Render holds them, per the architecture decision); this script
 # only ever knows a shared secret and the Render URL, both Kaggle Secrets.
 # Deliberately NON-FATAL: a Render/network hiccup here must never kill a
 # multi-hour world scan. The Kaggle Dataset checkpoint above (and the final
 # parquet export below) stay the real source of truth either way — this is
-# a live mirror into Supabase, not a replacement for them.
+# a live mirror into the live database, not a replacement for them.
 try:
     RENDER_INGEST_URL = _s.get_secret("RENDER_INGEST_URL").rstrip("/") + "/api/ingest/businesses"
     INGEST_SECRET = _s.get_secret("INGEST_SECRET")
     INGEST_ENABLED = True
-    print(f"Live Supabase ingest ENABLED -> {RENDER_INGEST_URL}")
+    print(f"Live ingest ENABLED -> {RENDER_INGEST_URL}")
 except Exception as e:
     INGEST_ENABLED = False
-    print(f"Live Supabase ingest DISABLED (no RENDER_INGEST_URL/INGEST_SECRET secret set: {e}). "
+    print(f"Live ingest DISABLED (no RENDER_INGEST_URL/INGEST_SECRET secret set: {e}). "
           f"Scan will still produce the Kaggle checkpoint/final parquet as always — this is optional.")
 
 INGEST_BATCH_SIZE = 500   # keep each POST small; a 15-degree tile can have many thousands of rows
@@ -137,7 +137,7 @@ def ingest_tile_to_render(df):
                 print(f"  ingest batch failed after retry: {e}")
                 failed += len(batch)
     if failed:
-        print(f"  ingest: {sent} rows synced to Supabase, {failed} rows failed this tile "
+        print(f"  ingest: {sent} rows synced to the live database, {failed} rows failed this tile "
               f"(non-fatal — they're still safe in the Kaggle checkpoint, will retry next run's tiles)")
 
 # %% Always pull from the checkpoint dataset — the ONLY source of truth.

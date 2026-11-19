@@ -1,37 +1,45 @@
 """
-Company Scrapper — continuous scan worker (Render Background Worker)
+Company Scrapper — continuous scan worker (GitHub Actions / Render / any VM)
 ======================================================================
 Replaces the old Kaggle-notebook scanner for this job specifically. This
 was NEVER GPU work — DuckDB reading Overture Maps' S3 parquet is CPU/
-memory/network bound, nothing here ever touched a GPU. Kaggle was only
-ever used for (a) free compute and (b) Kaggle Datasets doubling as
-resumable checkpoint storage. Neither reason holds anymore: Supabase is
-now the live store, so resumability lives there too (the scan_tiles
-table from supabase/schema.sql), which means this worker needs ZERO
-local disk state and can be killed/restarted by Render at any point with
-nothing lost — it just picks up whatever tiles aren't marked done yet.
+memory/network bound, nothing here ever touched a GPU.
 
-Kaggle still matters for exactly the things that genuinely need a GPU:
-training the template model (train_the_ai.py) and deep on-demand natural-
-language research sessions with the real trained model
-(company_scrapper_ai.py). This worker does neither — it's pure
-deterministic data retrieval, same reasoning as why Company Scrapper's
-Render API never needed an LLM either.
+STORE: Prisma Postgres (direct psycopg2 connection — Prisma Postgres has
+no REST API like Supabase did, so this talks straight Postgres). Schema
+lives in database/schema.sql: a normalized schema (category/location/
+brand/status stored as small integer foreign keys into lookup tables
+instead of repeated text) built specifically to fit inside Prisma's free
+tier at real scan volume, plus LZ4 TOAST compression on the remaining
+free-text columns.
 
-Loop, forever:
-  1. Find the current Overture release.
-  2. Walk the world in TILE_DEG x TILE_DEG tiles. For each tile not yet
-     marked done (in Supabase's scan_tiles, keyed by release+tile so a
-     newer release's tiles are automatically "not done" with no reset
-     step ever needed): query it straight from S3 via DuckDB, upsert the
-     real rows into Supabase's businesses table, mark the tile done.
-  3. Once every tile for the current release is done, that's a full pass:
-     sleep SCAN_IDLE_SLEEP_SECONDS, then loop back to step 1 — which will
-     naturally pick up a newer release if Overture has published one
-     (they publish roughly monthly; this paces itself to that, it never
-     busy-loops hammering S3 for nothing).
+SCOPE: United States + the territories SBA actually lends in (Puerto
+Rico, Guam, US Virgin Islands, American Samoa, Northern Mariana Islands).
+Earlier this scanned the whole planet — ~88M+ rows, 40-50GB+ with
+indexes, which doesn't fit ANY provider's free tier, Prisma's included.
+SBA lending is a US program, so the other ~190 countries' data was never
+going to be used by this product. Scoping to the US drops both the
+compute (way fewer tiles to walk) and the storage (an order of magnitude
+fewer rows) at the same time, which is the only lever that actually fixes
+"too big" — compression and a smaller provider tier help on the margins,
+but scope is what makes this fit at all.
 
-Required env vars: SUPABASE_URL, SUPABASE_SERVICE_KEY.
+Resumability lives entirely in Postgres (the scan_tiles table), so this
+worker needs ZERO local disk state and can be killed/restarted at any
+point with nothing lost — it just picks up whatever tiles aren't marked
+done yet for the current release.
+
+Operation-count discipline (Prisma's free tier metering, not just
+storage, caps you — 200k ops/month): lookup tables (categories,
+locations, brands, statuses) are loaded into memory ONCE per pass, not
+queried per row or per tile. New lookup values seen in a batch are
+inserted in one bulk statement per batch, not one per value. Tile-done
+checks are loaded as a single set per pass instead of one query per tile.
+businesses are upserted with execute_values in batches, not row by row.
+
+Required env var: DATABASE_URL (a Prisma Postgres connection string —
+either the direct db.prisma.io or pooled pooled.db.prisma.io string both
+work for this worker's query pattern).
 Tunable env vars (see .env.example): TILE_DEG, DUCKDB_THREADS,
 DUCKDB_MEMORY_LIMIT, MIN_CONFIDENCE, SCAN_IDLE_SLEEP_SECONDS,
 INGEST_BATCH_SIZE.
@@ -39,92 +47,222 @@ INGEST_BATCH_SIZE.
 
 import sys
 import os
-import json
 import time
 from datetime import datetime, timezone
 
 import duckdb
 import requests
+import psycopg2
+import psycopg2.extras
 
-# Render's log stream isn't a real terminal, so Python block-buffers stdout
-# by default instead of flushing per-line — print() output can sit
-# invisible in the buffer for a long time (a crash on stderr would still
-# show up, since stderr is unbuffered by default; this is specifically
-# about stdout going quiet with no sign of a crash). Force line buffering
-# here so every print() below actually reaches the Render log in real time,
-# instead of relying on the service's Start Command including "python -u".
+# Render/Actions' log stream isn't a real terminal, so Python block-buffers
+# stdout by default instead of flushing per-line. Force line buffering so
+# every print() below actually reaches the log in real time.
 sys.stdout.reconfigure(line_buffering=True)
 
-SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 # A fixed tile size can never be "safe" everywhere — a 2-degree box over
-# open ocean and a 2-degree box over Lagos or Manhattan are wildly
-# different workloads. So TILE_DEG only sets the STARTING grid; any
-# individual region that still blows memory gets automatically quartered
-# and retried (see scan_region below) rather than this constant needing to
-# be tuned down to whatever the single densest spot on Earth requires.
+# open ocean and a 2-degree box over Manhattan are wildly different
+# workloads. TILE_DEG only sets the STARTING grid; any individual region
+# that still blows memory gets automatically quartered and retried (see
+# scan_region below).
 TILE_DEG = int(os.environ.get("TILE_DEG", "2"))
 MIN_SPLIT_DEG = float(os.environ.get("MIN_SPLIT_DEG", "0.1"))  # stop subdividing below this size
 MAX_SPLIT_DEPTH = int(os.environ.get("MAX_SPLIT_DEPTH", "8"))
 MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", "0.0"))
 THREADS = int(os.environ.get("DUCKDB_THREADS", "1"))
-# Conservative default for Render's base 512MB worker tier: DuckDB's
-# memory_limit only bounds its own buffer manager, not the Python process
-# as a whole (pandas/pyarrow materialization of a fetched result lives
-# outside that accounting), so this is set well under the box's real RAM
-# rather than right up against it. Raise it if you're on a bigger plan.
 MEMORY_LIMIT = os.environ.get("DUCKDB_MEMORY_LIMIT", "300MB")
 SCAN_IDLE_SLEEP_SECONDS = int(os.environ.get("SCAN_IDLE_SLEEP_SECONDS", str(6 * 3600)))
 INGEST_BATCH_SIZE = int(os.environ.get("INGEST_BATCH_SIZE", "500"))
 FALLBACK_RELEASE = "2026-10-21.0"  # only used if the live STAC lookup fails
 
-_HEADERS = {
-    "apikey": SUPABASE_SERVICE_KEY,
-    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    "Content-Type": "application/json",
-}
+# United States bounding box (CONUS + Alaska + Hawaii + Puerto Rico + US
+# Virgin Islands) plus small explicit boxes for the three Pacific
+# territories that fall way outside that box. country='US' is still
+# applied in SQL on every box, so e.g. the slivers of Canada/Mexico/
+# Bahamas/Marshall Islands/Palau that fall inside these boxes get
+# filtered out there, not by the geography alone.
+US_REGIONS = [
+    (-180.0, 14.0, -64.0, 72.0),    # CONUS, Alaska, Hawaii, PR, USVI
+    (144.5, 13.0, 145.2, 15.3),     # Guam
+    (144.8, 14.0, 146.2, 20.6),     # Northern Mariana Islands
+    (-170.9, -14.6, -169.3, -14.0),  # American Samoa
+]
 
 
 def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def supabase_upsert_businesses(records):
-    """Real upsert via PostgREST's merge-duplicates conflict resolution —
-    same semantics as the Node service's on_conflict('id') upsert, just
-    called directly since this worker already holds the Supabase key
-    (it's Render-side infra, not Kaggle, so that's consistent with the
-    'only Render holds Supabase credentials' rule, not a violation of it)."""
+def pg_connect():
+    con = psycopg2.connect(DATABASE_URL)
+    con.autocommit = True
+    return con
+
+
+class Lookups:
+    """categories/locations/brands/statuses, loaded once per pass and kept
+    in memory for the whole run — this is what keeps per-tile Postgres
+    traffic to a handful of statements instead of a query per row."""
+
+    def __init__(self, pg):
+        self.pg = pg
+        self.categories = self._load("categories", "name")
+        self.locations = self._load_locations()
+        self.brands = self._load("brands", "name")
+        self.statuses = self._load("statuses", "name")
+
+    def _load(self, table, col):
+        with self.pg.cursor() as cur:
+            cur.execute(f"SELECT {col}, id FROM {table}")
+            return dict(cur.fetchall())
+
+    def _load_locations(self):
+        with self.pg.cursor() as cur:
+            cur.execute("SELECT city, region, country, id FROM locations")
+            return {(c, r, k): i for (c, r, k, i) in cur.fetchall()}
+
+    def _ensure_simple(self, table, col, cache, values):
+        """Bulk-inserts any values not already cached, in ONE statement,
+        then merges the new ids back into the cache. values may contain
+        None/''/duplicates — all filtered before hitting Postgres."""
+        new_values = sorted({v for v in values if v and v not in cache})
+        if not new_values:
+            return
+        with self.pg.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                f"INSERT INTO {table} ({col}) VALUES %s ON CONFLICT ({col}) DO NOTHING",
+                [(v,) for v in new_values],
+            )
+            cur.execute(f"SELECT {col}, id FROM {table} WHERE {col} = ANY(%s)", (new_values,))
+            cache.update(cur.fetchall())
+
+    def ensure_categories(self, values):
+        self._ensure_simple("categories", "name", self.categories, values)
+
+    def ensure_brands(self, values):
+        self._ensure_simple("brands", "name", self.brands, values)
+
+    def ensure_statuses(self, values):
+        self._ensure_simple("statuses", "name", self.statuses, values)
+
+    def ensure_locations(self, triples):
+        """triples: iterable of (city, region, country) with '' for missing
+        city/region (never None — the unique constraint treats every null
+        as distinct, so '' is the real "no value" here, same convention as
+        the locations table itself)."""
+        new_triples = sorted({t for t in triples if t[2] and t not in self.locations})
+        if not new_triples:
+            return
+        with self.pg.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO locations (city, region, country) VALUES %s "
+                "ON CONFLICT (city, region, country) DO NOTHING",
+                new_triples,
+            )
+            # Row-comparison against an array of tuples isn't something
+            # psycopg2/Postgres do directly ("= ANY(%s)" fails with a
+            # DatatypeMismatch for composite values) — zip the three
+            # columns back into rows with unnest() and join on that instead.
+            cities = [t[0] for t in new_triples]
+            regions = [t[1] for t in new_triples]
+            countries = [t[2] for t in new_triples]
+            cur.execute(
+                """
+                SELECT l.city, l.region, l.country, l.id
+                FROM locations l
+                JOIN (
+                    SELECT unnest(%s::text[]) AS city, unnest(%s::text[]) AS region, unnest(%s::text[]) AS country
+                ) t ON l.city = t.city AND l.region = t.region AND l.country = t.country
+                """,
+                (cities, regions, countries),
+            )
+            for (c, r, k, i) in cur.fetchall():
+                self.locations[(c, r, k)] = i
+
+
+def pg_upsert_businesses(pg, lookups, records):
+    """Resolves category/location/brand/status text to integer ids using
+    the in-memory lookup cache (bulk-inserting anything new first), then
+    upserts the real business rows in batches with execute_values."""
     if not records:
         return
-    headers = dict(_HEADERS)
-    headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-    for i in range(0, len(records), INGEST_BATCH_SIZE):
-        batch = records[i:i + INGEST_BATCH_SIZE]
-        for b in batch:
-            b["last_seen_at"] = _now_iso()
-        r = requests.post(f"{SUPABASE_URL}/rest/v1/businesses", headers=headers, json=batch, timeout=60)
-        if r.status_code not in (200, 201, 204):
-            raise RuntimeError(f"Supabase upsert failed (HTTP {r.status_code}): {r.text[:400]}")
 
+    def norm(v):
+        return v if v not in (None, "") else ""
 
-def supabase_tile_done(tile_key):
-    r = requests.get(
-        f"{SUPABASE_URL}/rest/v1/scan_tiles", headers=_HEADERS,
-        params={"tile_key": f"eq.{tile_key}", "select": "tile_key"}, timeout=15,
+    lookups.ensure_categories(norm(r.get("category")) for r in records)
+    lookups.ensure_categories(norm(r.get("category_extra")) for r in records)
+    lookups.ensure_brands(norm(r.get("brand")) for r in records)
+    lookups.ensure_statuses(norm(r.get("operating_status")) for r in records)
+    lookups.ensure_locations(
+        (norm(r.get("city")), norm(r.get("region")), norm(r.get("country")) or "US")
+        for r in records
     )
-    r.raise_for_status()
-    return len(r.json()) > 0
+
+    now = _now_iso()
+    rows = []
+    for r in records:
+        country = norm(r.get("country")) or "US"
+        loc_key = (norm(r.get("city")), norm(r.get("region")), country)
+        rows.append((
+            r["id"], r.get("name"),
+            lookups.categories.get(norm(r.get("category"))),
+            lookups.categories.get(norm(r.get("category_extra"))),
+            r.get("address"),
+            lookups.locations.get(loc_key),
+            r.get("postcode"), r.get("phone"), r.get("website"), r.get("email"), r.get("social"),
+            lookups.brands.get(norm(r.get("brand"))),
+            r.get("confidence"),
+            lookups.statuses.get(norm(r.get("operating_status"))),
+            r.get("lon"), r.get("lat"),
+            now,
+        ))
+
+    with pg.cursor() as cur:
+        for i in range(0, len(rows), INGEST_BATCH_SIZE):
+            batch = rows[i:i + INGEST_BATCH_SIZE]
+            psycopg2.extras.execute_values(cur, """
+                INSERT INTO businesses (
+                    id, name, category_id, category_extra_id, address, location_id,
+                    postcode, phone, website, email, social, brand_id, confidence,
+                    status_id, lon, lat, last_seen_at
+                ) VALUES %s
+                ON CONFLICT (id) DO UPDATE SET
+                    name = excluded.name, category_id = excluded.category_id,
+                    category_extra_id = excluded.category_extra_id, address = excluded.address,
+                    location_id = excluded.location_id, postcode = excluded.postcode,
+                    phone = excluded.phone, website = excluded.website, email = excluded.email,
+                    social = excluded.social, brand_id = excluded.brand_id,
+                    confidence = excluded.confidence, status_id = excluded.status_id,
+                    lon = excluded.lon, lat = excluded.lat, last_seen_at = excluded.last_seen_at
+            """, batch)
 
 
-def supabase_mark_tile_done(tile_key, release, n):
-    headers = dict(_HEADERS)
-    headers["Prefer"] = "resolution=merge-duplicates,return=minimal"
-    row = {"tile_key": tile_key, "release": release, "rows_found": n, "scanned_at": _now_iso()}
-    r = requests.post(f"{SUPABASE_URL}/rest/v1/scan_tiles", headers=headers, json=[row], timeout=15)
-    if r.status_code not in (200, 201, 204):
-        raise RuntimeError(f"Failed to mark tile done (HTTP {r.status_code}): {r.text[:300]}")
+def load_done_tiles(pg, release):
+    """One query for the WHOLE pass instead of one per tile — this is the
+    change that keeps tile-done checks off Prisma's metered-operations
+    budget almost entirely."""
+    with pg.cursor() as cur:
+        cur.execute("SELECT tile_key FROM scan_tiles WHERE release = %s", (release,))
+        return {row[0] for row in cur.fetchall()}
+
+
+def flush_done_tiles(pg, pending):
+    """pending: list of (tile_key, release, rows_found) tuples, batched and
+    flushed together rather than one insert per tile."""
+    if not pending:
+        return
+    with pg.cursor() as cur:
+        psycopg2.extras.execute_values(cur, """
+            INSERT INTO scan_tiles (tile_key, release, rows_found, scanned_at) VALUES %s
+            ON CONFLICT (tile_key) DO UPDATE SET
+                rows_found = excluded.rows_found, scanned_at = excluded.scanned_at
+        """, [(k, r, n, _now_iso()) for (k, r, n) in pending])
+    pending.clear()
 
 
 def latest_release():
@@ -139,33 +277,33 @@ def latest_release():
 def _pick(cols, *candidates):
     """Picks the first column expression whose source column actually
     exists in this release's schema — Overture's exact field names drift
-    slightly release to release, and this must never silently emit NULL
-    for a column that's really there under a different name without at
-    least trying the known alternates first."""
+    slightly release to release."""
     for expr, needed_col in candidates:
         if needed_col in cols:
             return expr
     return "NULL"
 
 
-def scan_region(con, select, cols, x0, y0, x1, y1, depth=0):
-    """Queries one lon/lat bounding box. If it fails (almost always an OOM
-    on a dense region at this process's memory budget, though any
-    exception triggers the same recovery), and the box is still bigger
-    than MIN_SPLIT_DEG and we haven't hit MAX_SPLIT_DEPTH, it quarters the
-    box and recurses on each quadrant instead of giving up or silently
-    using a bigger memory_limit than the box actually has. Returns the
-    real row count found (0 is a legitimate, honest answer for an empty
-    region like open ocean — it is never used to mean 'failed')."""
-    where = f"bbox.xmin >= {x0} AND bbox.xmin < {x1} AND bbox.ymin >= {y0} AND bbox.ymin < {y1}"
+def scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1, depth=0):
+    """Queries one lon/lat bounding box, restricted to country='US' so we
+    never pull (and never store) non-US places that happen to fall inside
+    one of the US_REGIONS boxes. If it fails (almost always an OOM on a
+    dense region) and the box is still bigger than MIN_SPLIT_DEG and we
+    haven't hit MAX_SPLIT_DEPTH, it quarters the box and recurses on each
+    quadrant. Returns the real row count found (0 is a legitimate answer
+    for an empty region — never used to mean 'failed')."""
+    where = (
+        f"bbox.xmin >= {x0} AND bbox.xmin < {x1} AND bbox.ymin >= {y0} AND bbox.ymin < {y1} "
+        f"AND country = 'US'"
+    )
     if "confidence" in cols and MIN_CONFIDENCE > 0:
         where += f" AND confidence >= {MIN_CONFIDENCE}"
     try:
         df = con.execute(f"SELECT {select} FROM places WHERE {where}").fetchdf()
         n = len(df)
         if n > 0:
-            records = json.loads(df.to_json(orient="records"))  # NaN -> real null, safely
-            supabase_upsert_businesses(records)
+            records = df.where(df.notnull(), None).to_dict(orient="records")
+            pg_upsert_businesses(pg, lookups, records)
         return n
     except Exception as e:
         width = x1 - x0
@@ -179,11 +317,21 @@ def scan_region(con, select, cols, x0, y0, x1, y1, depth=0):
         total = 0
         for (sx0, sy0, sx1, sy1) in [(x0, y0, mx, my), (mx, y0, x1, my),
                                       (x0, my, mx, y1), (mx, my, x1, y1)]:
-            total += scan_region(con, select, cols, sx0, sy0, sx1, sy1, depth + 1)
+            total += scan_region(con, pg, lookups, select, cols, sx0, sy0, sx1, sy1, depth + 1)
         return total
 
 
-def run_one_pass(release, deadline=None):
+def _tiles_for_region(x0, y0, x1, y1, step):
+    x = x0
+    while x < x1:
+        y = y0
+        while y < y1:
+            yield (x, y, min(x + step, x1), min(y + step, y1))
+            y += step
+        x += step
+
+
+def run_one_pass(release, pg, deadline=None):
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     con.execute("SET s3_region='us-west-2';")
@@ -213,25 +361,31 @@ def run_one_pass(release, deadline=None):
       bbox.ymin AS lat
     """
 
-    tiles = [(x, y) for x in range(-180, 180, TILE_DEG) for y in range(-90, 90, TILE_DEG)]
-    print(f"Pass against release {release}: {len(tiles)} tiles total ({TILE_DEG}x{TILE_DEG} deg each).")
+    tiles = [t for (x0, y0, x1, y1) in US_REGIONS for t in _tiles_for_region(x0, y0, x1, y1, TILE_DEG)]
+    print(f"Pass against release {release}: {len(tiles)} tiles total ({TILE_DEG}x{TILE_DEG} deg each, "
+          f"US + SBA territories only).")
+
+    lookups = Lookups(pg)
+    done_tiles = load_done_tiles(pg, release)  # ONE query for the whole pass
+    pending_done = []
     did_any_work = False
 
-    for i, (x, y) in enumerate(tiles, 1):
+    for i, (x0, y0, x1, y1) in enumerate(tiles, 1):
         if deadline is not None and time.monotonic() >= deadline:
             print(f"  runtime cap reached mid-pass at tile {i}/{len(tiles)} — stopping here, "
                   f"cleanly, nothing lost (unprocessed tiles just aren't marked done yet).")
+            flush_done_tiles(pg, pending_done)
             break
 
-        tile_key = f"{release}:{x}_{y}"
-        if supabase_tile_done(tile_key):
+        tile_key = f"{release}:{x0}_{y0}"
+        if tile_key in done_tiles:
             continue
         did_any_work = True
 
         n = None
         for attempt in range(3):
             try:
-                n = scan_region(con, select, cols, x, y, x + TILE_DEG, y + TILE_DEG)
+                n = scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1)
                 break
             except Exception as e:
                 print(f"  tile {tile_key} attempt {attempt + 1}/3 failed even after splitting: {e}")
@@ -241,9 +395,12 @@ def run_one_pass(release, deadline=None):
                   f"not marked done, will retry on a later loop iteration.")
             continue
 
-        supabase_mark_tile_done(tile_key, release, n)
-        print(f"[{i}/{len(tiles)}] tile {tile_key}: {n:,} rows synced to Supabase")
+        pending_done.append((tile_key, release, n))
+        if len(pending_done) >= 20:
+            flush_done_tiles(pg, pending_done)
+        print(f"[{i}/{len(tiles)}] tile {tile_key}: {n:,} US rows synced to Postgres")
 
+    flush_done_tiles(pg, pending_done)
     con.close()
     return did_any_work
 
@@ -252,34 +409,29 @@ def main():
     # MAX_RUNTIME_SECONDS is for a bounded host that re-triggers this
     # process on its own schedule instead of letting it run forever — a
     # GitHub Actions job (6-hour hard cap per job) being the real case this
-    # was added for. When it's set, the loop exits cleanly well before that
-    # cap instead of sleeping (sleeping would just burn the job's time
-    # budget doing nothing); the next scheduled workflow run is what makes
-    # this "continuous" there, the same role SCAN_IDLE_SLEEP_SECONDS plays
-    # on a host that stays up by itself (Render, a VM). Unset (the default)
-    # means run forever, unchanged from before.
+    # was added for. Unset (the default) means run forever (Render, a VM).
     max_runtime = os.environ.get("MAX_RUNTIME_SECONDS")
     deadline = time.monotonic() + int(max_runtime) if max_runtime else None
 
-    print("Company Scrapper scan worker starting — no GPU required, no local disk state kept."
+    print("Company Scrapper scan worker starting — US + SBA territories only, "
+          "no GPU required, no local disk state kept."
           + (f" Bounded run: exiting by ~{int(max_runtime)}s from now." if deadline else " Running indefinitely."))
 
+    pg = pg_connect()
     while True:
         if deadline and time.monotonic() >= deadline:
             print("MAX_RUNTIME_SECONDS reached — exiting cleanly so the scheduler can re-trigger. "
-                  "Nothing lost: progress lives in Supabase's scan_tiles table, not in this process.")
+                  "Nothing lost: progress lives in Postgres's scan_tiles table, not in this process.")
+            pg.close()
             return
 
         release = latest_release()
         try:
-            did_work = run_one_pass(release, deadline)
+            did_work = run_one_pass(release, pg, deadline)
         except Exception as e:
-            # Never let one bad pass kill the worker forever — the host
-            # (Render, a VM) will restart on a hard crash anyway, but a
-            # transient S3/network blip shouldn't require manual
-            # intervention. Under a runtime cap, respect it here too rather
-            # than sleeping past the deadline.
             print(f"Pass against {release} failed with an unhandled error: {e}. Retrying in 5 minutes.")
+            if pg.closed:
+                pg = pg_connect()
             _sleep_respecting_deadline(300, deadline)
             continue
 
@@ -287,6 +439,7 @@ def main():
             if deadline:
                 print(f"Full pass against release {release} already complete — "
                       f"nothing left to do this run, exiting cleanly.")
+                pg.close()
                 return
             print(f"Full pass against release {release} already complete. "
                   f"Sleeping {SCAN_IDLE_SLEEP_SECONDS}s, then checking for a newer release...")

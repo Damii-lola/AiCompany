@@ -1,11 +1,17 @@
 "use strict";
-// Real category list, pulled LIVE from Supabase (never hardcoded/invented —
+// Real category list, pulled LIVE from Postgres (never hardcoded/invented —
 // mirrors company_scrapper_ai.py's REAL_CATEGORIES, but sourced from the
-// live, continuously-growing table instead of a point-in-time parquet file,
-// which is more correct for an "always updating" service). Cached briefly
-// so every request to /api/research doesn't re-scan the whole table.
+// live, continuously-growing table). Cached briefly so every request to
+// /api/research doesn't re-scan the whole table.
+//
+// Now backed by a real SELECT DISTINCT against the small `categories`
+// lookup table directly — the old Supabase version had to pull a 50,000-
+// row sample of raw text and dedupe client-side because PostgREST has no
+// native DISTINCT. A direct Postgres connection doesn't have that
+// limitation, and the categories table is tiny (one row per distinct
+// category, not per business), so this is now both simpler and exact.
 
-const { supabase } = require("./supabase");
+const { query } = require("./db");
 
 let cache = { categories: [], fetchedAt: 0 };
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — real data changes slowly enough that this is safe
@@ -14,16 +20,10 @@ async function getRealCategories() {
   const fresh = Date.now() - cache.fetchedAt < CACHE_TTL_MS;
   if (fresh && cache.categories.length > 0) return cache.categories;
 
-  // PostgREST has no native SELECT DISTINCT, so pull a capped sample of real
-  // category values and dedupe client-side — fine for a categorical column
-  // with a small number of distinct values relative to row count.
-  const { data: rows, error } = await supabase
-    .from("businesses")
-    .select("category")
-    .not("category", "is", null)
-    .limit(50000);
-  if (error) throw new Error(`Failed to load categories from Supabase: ${error.message}`);
-  cache = { categories: [...new Set(rows.map((r) => r.category))].sort(), fetchedAt: Date.now() };
+  const rows = await query(
+    "SELECT name FROM categories WHERE name IS NOT NULL AND name <> '' ORDER BY name"
+  );
+  cache = { categories: rows.map((r) => r.name), fetchedAt: Date.now() };
   return cache.categories;
 }
 

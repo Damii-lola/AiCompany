@@ -10,7 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY scan_worker.py .
 
-# No EXPOSE — this service makes outbound connections only (S3, Supabase,
+# No EXPOSE — this service makes outbound connections only (S3, Prisma Postgres,
 # Overture's STAC catalog), it never listens for inbound traffic, so the
 # VM's firewall never needs a port opened for it.
 CMD ["python", "scan_worker.py"]

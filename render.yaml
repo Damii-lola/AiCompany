@@ -1,11 +1,16 @@
-# Render Blueprint — documents the full two-service setup. Since
+# Render Blueprint — documents the web service's setup. Since
 # render-service was already created manually in the Render dashboard
 # (not via Blueprint sync), don't run "New -> Blueprint" from this file —
 # it may try to stand up a SEPARATE service from the one you already have.
-# Instead, create scanner-service by hand too: dashboard -> New ->
-# Background Worker, same rootDir/build/start/env values as below. This
-# file exists as the single source of truth for those values, not as
-# something Render auto-applies here.
+# This file exists as the single source of truth for those env values, not
+# as something Render auto-applies here.
+#
+# The scanner is NOT a Render service anymore — it moved to GitHub Actions
+# (.github/workflows/scan.yml), which is free/unlimited on a public repo
+# and doesn't hit Render's 512MB worker memory ceiling. If you still have
+# a "company-scrapper-scanner" Background Worker running on Render from
+# before, delete it — otherwise it's just duplicate work against the same
+# database.
 services:
   - type: web
     name: company-scrapper-service
@@ -14,29 +19,7 @@ services:
     buildCommand: npm install
     startCommand: npm start
     envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_KEY
+      - key: DATABASE_URL
         sync: false
       - key: INGEST_SECRET
         sync: false
-
-  - type: worker
-    name: company-scrapper-scanner
-    runtime: python
-    rootDir: scanner-service
-    buildCommand: pip install -r requirements.txt
-    startCommand: python scan_worker.py
-    envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_KEY
-        sync: false
-      - key: TILE_DEG
-        value: "10"
-      - key: DUCKDB_THREADS
-        value: "2"
-      - key: DUCKDB_MEMORY_LIMIT
-        value: "1536MB"
-      - key: SCAN_IDLE_SLEEP_SECONDS
-        value: "21600"

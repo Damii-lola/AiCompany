@@ -4,8 +4,8 @@ name: Company Scrapper scan
 # a GitHub Actions job hard-caps at 6 hours, so this is the "GitHub
 # Actions" deployment target scan_worker.py's MAX_RUNTIME_SECONDS was
 # built for: run for ~5.5h, exit clean, let the next scheduled trigger
-# pick back up. Nothing is lost between runs — progress lives in
-# Supabase's scan_tiles table, not in this job's own disk, which gets
+# pick back up. Nothing is lost between runs — progress lives in Prisma
+# Postgres's scan_tiles table, not in this job's own disk, which gets
 # thrown away the moment it ends either way.
 #
 # This repo is public, so these minutes are free and unlimited — no
@@ -42,8 +42,7 @@ jobs:
       - name: Run scan (bounded to ~5.5h, exits clean either way)
         working-directory: scanner-service
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           MAX_RUNTIME_SECONDS: "19800"
           TILE_DEG: "5"
           DUCKDB_THREADS: "2"
