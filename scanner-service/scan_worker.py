@@ -47,6 +47,7 @@ INGEST_BATCH_SIZE.
 
 import sys
 import os
+import json
 import time
 from datetime import datetime, timezone
 
@@ -127,7 +128,12 @@ class Lookups:
         """Bulk-inserts any values not already cached, in ONE statement,
         then merges the new ids back into the cache. values may contain
         None/''/duplicates — all filtered before hitting Postgres."""
-        new_values = sorted({v for v in values if v and v not in cache})
+        # isinstance check, not just truthiness: a stray float (NaN or
+        # otherwise) landing in this set alongside real strings is exactly
+        # what makes sorted({...}) raise "'<' not supported between
+        # instances of 'float' and 'str'" — defends this even if some other
+        # caller ever skips norm().
+        new_values = sorted({v for v in values if isinstance(v, str) and v and v not in cache})
         if not new_values:
             return
         with self.pg.cursor() as cur:
@@ -153,7 +159,10 @@ class Lookups:
         city/region (never None — the unique constraint treats every null
         as distinct, so '' is the real "no value" here, same convention as
         the locations table itself)."""
-        new_triples = sorted({t for t in triples if t[2] and t not in self.locations})
+        new_triples = sorted({
+            t for t in triples
+            if all(isinstance(x, str) for x in t) and t[2] and t not in self.locations
+        })
         if not new_triples:
             return
         with self.pg.cursor() as cur:
@@ -192,7 +201,13 @@ def pg_upsert_businesses(pg, lookups, records):
         return
 
     def norm(v):
-        return v if v not in (None, "") else ""
+        # Deliberately stricter than "v if v else ''": a bare float NaN is
+        # truthy in Python (bool(float('nan')) is True) and would otherwise
+        # sail through here as a real lookup value, land in the same set as
+        # real category/status strings, and blow up sorted({...}) with
+        # "'<' not supported between instances of 'float' and 'str'" the
+        # moment a float and a string land in the same set together.
+        return v if isinstance(v, str) and v else ""
 
     lookups.ensure_categories(norm(r.get("category")) for r in records)
     lookups.ensure_categories(norm(r.get("category_extra")) for r in records)
@@ -302,7 +317,16 @@ def scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1, depth=0):
         df = con.execute(f"SELECT {select} FROM places WHERE {where}").fetchdf()
         n = len(df)
         if n > 0:
-            records = df.where(df.notnull(), None).to_dict(orient="records")
+            # json round-trip, not df.where(df.notnull(), None).to_dict():
+            # pandas frequently reverts an assigned None right back to NaN
+            # on a float64 column (a well-known pandas quirk), so that
+            # version was silently leaking real float('nan') values into
+            # category/status/confidence fields — which then crashed
+            # sorted({...}) in Lookups the moment a NaN and a real string
+            # landed in the same set. JSON serialization has no such
+            # quirk: NaN always becomes JSON null, which json.loads() always
+            # turns back into a real Python None, for every dtype.
+            records = json.loads(df.to_json(orient="records"))
             pg_upsert_businesses(pg, lookups, records)
         return n
     except Exception as e:
