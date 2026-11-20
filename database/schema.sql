@@ -129,6 +129,14 @@ create or replace view businesses_readable as
 -- category names in -> resolved to category_id internally so callers
 -- never have to know ids exist.
 -- ---------------------------------------------------------------------
+-- returns a real TABLE (not "setof businesses_readable") specifically so
+-- distance_miles comes back as a genuine, queryable output column rather
+-- than something only this function's internal ORDER BY knows about.
+-- That matters once results from several shard databases need to be
+-- merged in application code (render-service/lib/db.js) and re-sorted
+-- by actual distance across all of them together — ordering each
+-- shard's own rows internally isn't enough once there's more than one
+-- shard's results to interleave.
 create or replace function businesses_within_radius(
   center_lat double precision,
   center_lon double precision,
@@ -136,8 +144,16 @@ create or replace function businesses_within_radius(
   categories_in text[] default null,
   only_no_website boolean default false,
   country_filter text default null
-) returns setof businesses_readable as $$
-  select r.*
+) returns table (
+  id text, name text, category text, category_extra text, address text,
+  city text, region text, country text, postcode text, phone text,
+  website text, email text, social text, brand text, confidence real,
+  operating_status text, lon real, lat real,
+  first_seen_at timestamptz, last_seen_at timestamptz,
+  distance_miles double precision
+) as $$
+  select r.*,
+    earth_distance(ll_to_earth(center_lat, center_lon), ll_to_earth(r.lat, r.lon)) / 1609.34 as distance_miles
   from businesses_readable r
   where r.lat is not null and r.lon is not null
     and earth_box(ll_to_earth(center_lat, center_lon), radius_miles * 1609.34) @> ll_to_earth(r.lat, r.lon)
@@ -145,7 +161,7 @@ create or replace function businesses_within_radius(
     and (categories_in is null or r.category = any(categories_in))
     and (only_no_website = false or r.website is null or trim(r.website) = '')
     and (country_filter is null or r.country = country_filter)
-  order by earth_distance(ll_to_earth(center_lat, center_lon), ll_to_earth(r.lat, r.lon)) asc;
+  order by distance_miles asc;
 $$ language sql stable;
 
 create or replace function businesses_trade_area_summary(

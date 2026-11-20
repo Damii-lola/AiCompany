@@ -4,9 +4,23 @@ name: Company Scrapper scan
 # a GitHub Actions job hard-caps at 6 hours, so this is the "GitHub
 # Actions" deployment target scan_worker.py's MAX_RUNTIME_SECONDS was
 # built for: run for ~5.5h, exit clean, let the next scheduled trigger
-# pick back up. Nothing is lost between runs — progress lives in Prisma
-# Postgres's scan_tiles table, not in this job's own disk, which gets
-# thrown away the moment it ends either way.
+# pick back up. Nothing is lost between runs — progress lives in each
+# shard database's own scan_tiles table, not in this job's own disk,
+# which gets thrown away the moment it ends either way.
+#
+# SHARDING: one free Prisma Postgres database caps out well before a full
+# US+territories backfill finishes (2GB storage / 200k ops per month), so
+# the work is split across as many free Prisma databases as you add here
+# as DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... secrets —
+# scan_worker.py discovers whichever numbered ones exist and scans all of
+# them AT THE SAME TIME (one thread per shard). Add every DATABASE_URL_N
+# secret you want BELOW in the env block (GitHub Actions doesn't support
+# wildcard secret passthrough, so each numbered one needs its own line
+# here) before the shard count you want is live, and apply
+# database/schema.sql to each new shard database by hand before wiring up
+# its secret, same one-time manual step as before. Leave the shard count
+# alone until a full pass finishes — see scan_worker.py's module
+# docstring for why.
 #
 # This repo is public, so these minutes are free and unlimited — no
 # billing setup needed anywhere for this, which is the whole reason this
@@ -42,9 +56,21 @@ jobs:
       - name: Run scan (bounded to ~5.5h, exits clean either way)
         working-directory: scanner-service
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Add one line per shard you've created — scan_worker.py picks
+          # up however many of these actually resolve to a non-empty
+          # value and ignores the rest (a secret that was never added in
+          # the repo's Settings -> Secrets just renders as empty here).
+          DATABASE_URL_1: ${{ secrets.DATABASE_URL_1 }}
+          DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
+          DATABASE_URL_3: ${{ secrets.DATABASE_URL_3 }}
+          DATABASE_URL_4: ${{ secrets.DATABASE_URL_4 }}
+          DATABASE_URL_5: ${{ secrets.DATABASE_URL_5 }}
           MAX_RUNTIME_SECONDS: "19800"
           TILE_DEG: "5"
           DUCKDB_THREADS: "2"
-          DUCKDB_MEMORY_LIMIT: "4096MB"
+          # Runs concurrently per shard now, so this is PER SHARD THREAD —
+          # total memory use is roughly (number of shards) x this value.
+          # ubuntu-latest gives ~16GB/4 cores: 1024MB is safe up to ~10
+          # shards at once; raise it back up if you're only running 1-2.
+          DUCKDB_MEMORY_LIMIT: "1024MB"
         run: python scan_worker.py

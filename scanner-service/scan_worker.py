@@ -10,8 +10,37 @@ no REST API like Supabase did, so this talks straight Postgres). Schema
 lives in database/schema.sql: a normalized schema (category/location/
 brand/status stored as small integer foreign keys into lookup tables
 instead of repeated text) built specifically to fit inside Prisma's free
-tier at real scan volume, plus LZ4 TOAST compression on the remaining
-free-text columns.
+tier at real scan volume.
+
+SHARDING: a single free Prisma Postgres database caps out at 2GB storage
+and 200k operations/month, which the US+territories backfill blows
+through before finishing one pass. Instead of paying for a bigger plan,
+this worker splits the work across as many free Prisma databases as you
+give it — set DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... (any
+number of them) as secrets and this worker:
+  1. splits the FULL tile list evenly across however many shards you
+     configured (round-robin by tile index, not a contiguous block —
+     see assign_tiles_to_shards below for why),
+  2. scans every shard's share CONCURRENTLY, one worker thread per shard,
+     each with its own DuckDB connection and its own Postgres connection
+     — all N databases are being written to at the same time, not one
+     after another.
+Each shard is a fully normal, independent copy of database/schema.sql —
+apply the schema to EVERY shard database before adding its
+DATABASE_URL_N secret. Lookup-table ids (category/location/brand/status)
+are NOT consistent across shards, but that's fine: every join always
+happens within one shard's own connection, never across shards.
+
+IMPORTANT: the shard COUNT has to stay fixed for an entire backfill pass.
+Tile-to-shard assignment is computed fresh from whatever DATABASE_URL_N
+secrets exist right now, so adding or removing a shard mid-pass reshuffles
+which shard owns which tile and would re-scan data into the wrong place.
+Decide how many shards you want, set all of them before you start (or
+before the next scheduled run picks up), and leave the count alone until
+a full pass finishes. This is a one-time backfill job anyway (see below) —
+once it's done, a shard count never needs to change again for it.
+A bare DATABASE_URL (no numeric suffix) still works too, as a single
+implicit shard — nothing above requires multiple databases.
 
 SCOPE: United States + the territories SBA actually lends in (Puerto
 Rico, Guam, US Virgin Islands, American Samoa, Northern Mariana Islands).
@@ -21,35 +50,45 @@ SBA lending is a US program, so the other ~190 countries' data was never
 going to be used by this product. Scoping to the US drops both the
 compute (way fewer tiles to walk) and the storage (an order of magnitude
 fewer rows) at the same time, which is the only lever that actually fixes
-"too big" — compression and a smaller provider tier help on the margins,
-but scope is what makes this fit at all.
+"too big" — sharding and scope both help, but scope is what makes any of
+this possible at all.
 
-Resumability lives entirely in Postgres (the scan_tiles table), so this
-worker needs ZERO local disk state and can be killed/restarted at any
-point with nothing lost — it just picks up whatever tiles aren't marked
-done yet for the current release.
+Resumability lives entirely in Postgres (each shard's own scan_tiles
+table), so this worker needs ZERO local disk state and can be killed/
+restarted at any point with nothing lost — it just picks up whatever
+tiles aren't marked done yet, per shard, for the current release. This
+scanner's job is a one-time backfill ("find it and add it once") — a
+separate, future, targeted "updater" script is the planned place for
+checking whether a specific already-known business has since changed
+(ownership transfer, closed down, moved); this worker intentionally never
+overwrites a business it's already seen (see pg_upsert_businesses below).
 
 Operation-count discipline (Prisma's free tier metering, not just
-storage, caps you — 200k ops/month): lookup tables (categories,
-locations, brands, statuses) are loaded into memory ONCE per pass, not
-queried per row or per tile. New lookup values seen in a batch are
-inserted in one bulk statement per batch, not one per value. Tile-done
-checks are loaded as a single set per pass instead of one query per tile.
-businesses are upserted with execute_values in batches, not row by row.
+storage, caps you — 200k ops/month PER shard): lookup tables (categories,
+locations, brands, statuses) are loaded into memory ONCE per shard per
+pass, not queried per row or per tile. New lookup values seen in a batch
+are inserted in one bulk statement per batch, not one per value. Tile-done
+checks are loaded as a single set per shard per pass instead of one query
+per tile. businesses are upserted with execute_values in batches, not row
+by row.
 
-Required env var: DATABASE_URL (a Prisma Postgres connection string —
-either the direct db.prisma.io or pooled pooled.db.prisma.io string both
-work for this worker's query pattern).
+Required env vars: DATABASE_URL_1 (and DATABASE_URL_2, DATABASE_URL_3,
+... for more shards), or a bare DATABASE_URL for a single-database setup.
 Tunable env vars (see .env.example): TILE_DEG, DUCKDB_THREADS,
 DUCKDB_MEMORY_LIMIT, MIN_CONFIDENCE, SCAN_IDLE_SLEEP_SECONDS,
-INGEST_BATCH_SIZE.
+INGEST_BATCH_SIZE. Note DUCKDB_MEMORY_LIMIT applies PER SHARD THREAD and
+all shards run at once, so total memory use is roughly
+(number of shards) x DUCKDB_MEMORY_LIMIT — lower it if you configure a lot
+of shards on a memory-capped runner.
 """
 
 import sys
 import os
+import re
 import json
 import time
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import duckdb
 import requests
@@ -58,10 +97,10 @@ import psycopg2.extras
 
 # Render/Actions' log stream isn't a real terminal, so Python block-buffers
 # stdout by default instead of flushing per-line. Force line buffering so
-# every print() below actually reaches the log in real time.
+# every print() below actually reaches the log in real time — including
+# from the shard worker threads below, since prints from multiple threads
+# interleave but each line is still written atomically.
 sys.stdout.reconfigure(line_buffering=True)
-
-DATABASE_URL = os.environ["DATABASE_URL"]
 
 # A fixed tile size can never be "safe" everywhere — a 2-degree box over
 # open ocean and a 2-degree box over Manhattan are wildly different
@@ -96,16 +135,43 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def pg_connect():
-    con = psycopg2.connect(DATABASE_URL)
+def discover_shards():
+    """Finds every DATABASE_URL_<N> secret that's set (DATABASE_URL_1,
+    DATABASE_URL_2, ...) and returns them as a sorted list of
+    (shard_num, url) tuples. Falls back to a bare DATABASE_URL (no suffix)
+    as a single implicit shard 1 if no numbered secrets are set at all, so
+    a single-database setup works with zero config changes."""
+    shards = []
+    pattern = re.compile(r"^DATABASE_URL_(\d+)$")
+    for key, value in os.environ.items():
+        m = pattern.match(key)
+        if m and value:
+            shards.append((int(m.group(1)), value))
+    shards.sort(key=lambda t: t[0])
+    if not shards:
+        bare = os.environ.get("DATABASE_URL")
+        if not bare:
+            raise RuntimeError(
+                "No database configured. Set DATABASE_URL_1 (and DATABASE_URL_2, "
+                "DATABASE_URL_3, ... for more shards), or a bare DATABASE_URL for a "
+                "single-database setup."
+            )
+        shards = [(1, bare)]
+    return shards
+
+
+def pg_connect(url):
+    con = psycopg2.connect(url)
     con.autocommit = True
     return con
 
 
 class Lookups:
-    """categories/locations/brands/statuses, loaded once per pass and kept
-    in memory for the whole run — this is what keeps per-tile Postgres
-    traffic to a handful of statements instead of a query per row."""
+    """categories/locations/brands/statuses, loaded once per shard per
+    pass and kept in memory for the whole run — this is what keeps
+    per-tile Postgres traffic to a handful of statements instead of a
+    query per row. One Lookups instance per shard connection — the ids it
+    caches are only meaningful against that one shard's own tables."""
 
     def __init__(self, pg):
         self.pg = pg
@@ -266,7 +332,10 @@ def pg_upsert_businesses(pg, lookups, records):
 def load_done_tiles(pg, release):
     """One query for the WHOLE pass instead of one per tile — this is the
     change that keeps tile-done checks off Prisma's metered-operations
-    budget almost entirely."""
+    budget almost entirely. Each shard only ever needs ITS OWN done-tiles
+    set, never another shard's — tile-to-shard assignment is static for a
+    pass (see assign_tiles_to_shards), so a tile this shard hasn't scanned
+    yet was never going to be in another shard's scan_tiles either."""
     with pg.cursor() as cur:
         cur.execute("SELECT tile_key FROM scan_tiles WHERE release = %s", (release,))
         return {row[0] for row in cur.fetchall()}
@@ -374,14 +443,86 @@ def _tiles_for_region(x0, y0, x1, y1, step):
         x += step
 
 
-def run_one_pass(release, pg, deadline=None):
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    con.execute("SET s3_region='us-west-2';")
-    con.execute(f"SET threads={THREADS}; SET memory_limit='{MEMORY_LIMIT}';")
+def assign_tiles_to_shards(tiles, num_shards):
+    """Round-robins the full tile list across shards by index (tile i goes
+    to shard bucket i % num_shards) instead of chopping it into
+    contiguous blocks. A contiguous split would hand one shard a solid
+    wall of dense-metro tiles (slow, row-heavy) and another shard a solid
+    wall of open-ocean tiles (fast, almost empty) — round-robin spreads
+    that unevenness across every shard instead, so they all finish around
+    the same time and end up with roughly similar row counts."""
+    buckets = [[] for _ in range(num_shards)]
+    for i, tile in enumerate(tiles):
+        buckets[i % num_shards].append(tile)
+    return buckets
+
+
+def run_shard_pass(shard_num, url, tiles, release, con_factory, select, cols, deadline=None):
+    """Runs one shard's share of a pass start to finish: its own Postgres
+    connection, its own Lookups cache, its own scan_tiles done-set, its
+    own DuckDB connection (built fresh via con_factory so threads never
+    share a DuckDB connection). Returns True if this shard had any
+    not-yet-done tile to work on this call."""
+    pg = pg_connect(url)
+    con = con_factory()
+    try:
+        lookups = Lookups(pg)
+        done_tiles = load_done_tiles(pg, release)  # ONE query for this shard's whole pass
+        pending_done = []
+        did_any_work = False
+
+        for i, (x0, y0, x1, y1) in enumerate(tiles, 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f"[shard {shard_num}] runtime cap reached mid-pass at tile {i}/{len(tiles)} — "
+                      f"stopping here, cleanly, nothing lost.")
+                flush_done_tiles(pg, pending_done)
+                break
+
+            tile_key = f"{release}:{x0}_{y0}"
+            if tile_key in done_tiles:
+                continue
+            did_any_work = True
+
+            n = None
+            for attempt in range(3):
+                try:
+                    n = scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1)
+                    break
+                except Exception as e:
+                    print(f"[shard {shard_num}] tile {tile_key} attempt {attempt + 1}/3 failed "
+                          f"even after splitting: {e}")
+                    time.sleep(5 * (attempt + 1))
+            if n is None:
+                print(f"[shard {shard_num}] SKIPPED {tile_key} after 3 failed attempts — "
+                      f"not marked done, will retry on a later loop iteration.")
+                continue
+
+            pending_done.append((tile_key, release, n))
+            if len(pending_done) >= 20:
+                flush_done_tiles(pg, pending_done)
+            print(f"[shard {shard_num}] [{i}/{len(tiles)}] tile {tile_key}: {n:,} US rows synced")
+
+        flush_done_tiles(pg, pending_done)
+        return did_any_work
+    finally:
+        con.close()
+        pg.close()
+
+
+def run_one_pass(release, shards, deadline=None):
+    """Builds the tile list and the Overture column-presence probe ONCE,
+    splits the tile list across every configured shard, then scans all
+    shards CONCURRENTLY — one worker thread per shard, each fully
+    independent (own DuckDB connection, own Postgres connection, own
+    Lookups cache), so every configured database is being written to at
+    the same time rather than one after another."""
+    probe = duckdb.connect()
+    probe.execute("INSTALL httpfs; LOAD httpfs;")
+    probe.execute("SET s3_region='us-west-2';")
     src = f"s3://overturemaps-us-west-2/release/{release}/theme=places/type=place/*"
-    con.execute(f"CREATE VIEW places AS SELECT * FROM read_parquet('{src}', hive_partitioning=1);")
-    cols = {r[0] for r in con.execute("DESCRIBE places").fetchall()}
+    probe.execute(f"CREATE VIEW places AS SELECT * FROM read_parquet('{src}', hive_partitioning=1);")
+    cols = {r[0] for r in probe.execute("DESCRIBE places").fetchall()}
+    probe.close()
 
     select = f"""
       id,
@@ -405,46 +546,41 @@ def run_one_pass(release, pg, deadline=None):
     """
 
     tiles = [t for (x0, y0, x1, y1) in US_REGIONS for t in _tiles_for_region(x0, y0, x1, y1, TILE_DEG)]
+    buckets = assign_tiles_to_shards(tiles, len(shards))
+    summary = ", ".join(f"shard {num}: {len(bucket)} tiles" for (num, _url), bucket in zip(shards, buckets))
     print(f"Pass against release {release}: {len(tiles)} tiles total ({TILE_DEG}x{TILE_DEG} deg each, "
-          f"US + SBA territories only).")
+          f"US + SBA territories only), split across {len(shards)} shard database(s) running "
+          f"concurrently — {summary}.")
 
-    lookups = Lookups(pg)
-    done_tiles = load_done_tiles(pg, release)  # ONE query for the whole pass
-    pending_done = []
+    def con_factory():
+        con = duckdb.connect()
+        con.execute("INSTALL httpfs; LOAD httpfs;")
+        con.execute("SET s3_region='us-west-2';")
+        con.execute(f"SET threads={THREADS}; SET memory_limit='{MEMORY_LIMIT}';")
+        con.execute(f"CREATE VIEW places AS SELECT * FROM read_parquet('{src}', hive_partitioning=1);")
+        return con
+
     did_any_work = False
-
-    for i, (x0, y0, x1, y1) in enumerate(tiles, 1):
-        if deadline is not None and time.monotonic() >= deadline:
-            print(f"  runtime cap reached mid-pass at tile {i}/{len(tiles)} — stopping here, "
-                  f"cleanly, nothing lost (unprocessed tiles just aren't marked done yet).")
-            flush_done_tiles(pg, pending_done)
-            break
-
-        tile_key = f"{release}:{x0}_{y0}"
-        if tile_key in done_tiles:
-            continue
-        did_any_work = True
-
-        n = None
-        for attempt in range(3):
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(shards), thread_name_prefix="shard") as pool:
+        futures = {
+            pool.submit(run_shard_pass, shard_num, url, bucket, release, con_factory, select, cols, deadline): shard_num
+            for (shard_num, url), bucket in zip(shards, buckets)
+        }
+        for future in as_completed(futures):
+            shard_num = futures[future]
             try:
-                n = scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1)
-                break
+                if future.result():
+                    did_any_work = True
             except Exception as e:
-                print(f"  tile {tile_key} attempt {attempt + 1}/3 failed even after splitting: {e}")
-                time.sleep(5 * (attempt + 1))
-        if n is None:
-            print(f"  SKIPPED {tile_key} after 3 failed attempts — "
-                  f"not marked done, will retry on a later loop iteration.")
-            continue
-
-        pending_done.append((tile_key, release, n))
-        if len(pending_done) >= 20:
-            flush_done_tiles(pg, pending_done)
-        print(f"[{i}/{len(tiles)}] tile {tile_key}: {n:,} US rows synced to Postgres")
-
-    flush_done_tiles(pg, pending_done)
-    con.close()
+                print(f"[shard {shard_num}] pass failed with an unhandled error: {e}")
+                errors.append((shard_num, e))
+    # every shard's thread has finished (the `with` block above blocks on
+    # shutdown until they all complete) before we ever get here, so a
+    # failure in one shard never cuts the others' progress short.
+    if errors:
+        shard_list = ", ".join(str(n) for n, _ in errors)
+        raise RuntimeError(f"shard(s) {shard_list} failed this pass — see logs above for each error")
     return did_any_work
 
 
@@ -456,35 +592,33 @@ def main():
     max_runtime = os.environ.get("MAX_RUNTIME_SECONDS")
     deadline = time.monotonic() + int(max_runtime) if max_runtime else None
 
+    shards = discover_shards()
+    shard_nums = ", ".join(str(n) for n, _ in shards)
     print("Company Scrapper scan worker starting — US + SBA territories only, "
-          "no GPU required, no local disk state kept."
+          f"no GPU required, no local disk state kept. {len(shards)} shard database(s) configured "
+          f"(shard numbers: {shard_nums})."
           + (f" Bounded run: exiting by ~{int(max_runtime)}s from now." if deadline else " Running indefinitely."))
 
-    pg = pg_connect()
     while True:
         if deadline and time.monotonic() >= deadline:
             print("MAX_RUNTIME_SECONDS reached — exiting cleanly so the scheduler can re-trigger. "
-                  "Nothing lost: progress lives in Postgres's scan_tiles table, not in this process.")
-            pg.close()
+                  "Nothing lost: progress lives in each shard's own scan_tiles table, not in this process.")
             return
 
         release = latest_release()
         try:
-            did_work = run_one_pass(release, pg, deadline)
+            did_work = run_one_pass(release, shards, deadline)
         except Exception as e:
             print(f"Pass against {release} failed with an unhandled error: {e}. Retrying in 5 minutes.")
-            if pg.closed:
-                pg = pg_connect()
             _sleep_respecting_deadline(300, deadline)
             continue
 
         if not did_work:
             if deadline:
-                print(f"Full pass against release {release} already complete — "
+                print(f"Full pass against release {release} already complete across every shard — "
                       f"nothing left to do this run, exiting cleanly.")
-                pg.close()
                 return
-            print(f"Full pass against release {release} already complete. "
+            print(f"Full pass against release {release} already complete across every shard. "
                   f"Sleeping {SCAN_IDLE_SLEEP_SECONDS}s, then checking for a newer release...")
             time.sleep(SCAN_IDLE_SLEEP_SECONDS)
         # loop again regardless — either there's leftover work (retried

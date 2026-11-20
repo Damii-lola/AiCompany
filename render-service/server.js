@@ -4,10 +4,47 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 
-const { query } = require("./lib/db");
+const { shards, queryEachShard, queryAll } = require("./lib/db");
 const { getRealCategories, closeMatches } = require("./lib/categories");
 const { geocodeAddress } = require("./lib/geocode");
 const { upsertBusinesses } = require("./lib/upsert");
+
+// Shared by /api/trade-area and /api/research — both need the exact same
+// fan-out-across-shards-then-merge logic, so it lives in one place.
+// businesses_within_radius() now returns a real distance_miles column
+// (database/schema.sql) specifically so this can merge-sort every
+// shard's already-sorted results back into one correctly-ordered list,
+// instead of just concatenating shard 1's closest matches followed by
+// shard 2's closest matches.
+async function tradeAreaFanOut(lat, lon, radiusMiles, categories, noWebsiteOnly, country) {
+  const [businessRows, summaryRows] = await Promise.all([
+    queryEachShard(
+      "SELECT * FROM businesses_within_radius($1, $2, $3, $4, $5, $6)",
+      [lat, lon, radiusMiles, categories, !!noWebsiteOnly, country || null]
+    ),
+    queryEachShard(
+      "SELECT * FROM businesses_trade_area_summary($1, $2, $3, $4, $5)",
+      [lat, lon, radiusMiles, categories, country || null]
+    ),
+  ]);
+
+  const businesses = businessRows
+    .flatMap((s) => s.rows)
+    .sort((a, b) => a.distance_miles - b.distance_miles);
+
+  let competitor_count = 0, no_website_count = 0, nearest_miles = null;
+  for (const { rows } of summaryRows) {
+    const row = rows[0];
+    if (!row) continue;
+    competitor_count += Number(row.competitor_count) || 0;
+    no_website_count += Number(row.no_website_count) || 0;
+    if (row.nearest_miles != null && (nearest_miles === null || row.nearest_miles < nearest_miles)) {
+      nearest_miles = row.nearest_miles;
+    }
+  }
+
+  return { businesses, summary: { competitor_count, no_website_count, nearest_miles } };
+}
 
 const app = express();
 app.use(express.json({ limit: "10mb" })); // ingest batches can be sizeable
@@ -27,20 +64,32 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 // ---------------------------------------------------------------------
 app.get("/api/stats", async (_req, res) => {
   try {
-    const [{ total }] = await query("SELECT count(*)::int AS total FROM businesses");
-    const [{ no_website }] = await query(
-      "SELECT count(*)::int AS no_website FROM businesses WHERE website IS NULL OR website = ''"
-    );
-    const [{ last_updated }] = await query(
-      "SELECT max(last_seen_at) AS last_updated FROM businesses"
-    );
+    // One shard's count is meaningless on its own — sum every shard's
+    // count for a real total, and take the latest last_seen_at across
+    // all of them (a business synced into shard 2 ten minutes ago still
+    // counts as "last updated" even if shard 1 hasn't been touched today).
+    const perShard = await queryEachShard(`
+      SELECT count(*)::int AS total,
+             count(*) FILTER (WHERE website IS NULL OR website = '')::int AS no_website,
+             max(last_seen_at) AS last_updated
+      FROM businesses
+    `);
+    let total = 0, no_website = 0, last_updated = null;
+    for (const { rows: [row] } of perShard) {
+      total += row.total || 0;
+      no_website += row.no_website || 0;
+      if (row.last_updated && (!last_updated || row.last_updated > last_updated)) {
+        last_updated = row.last_updated;
+      }
+    }
     const categories = await getRealCategories();
 
     res.json({
-      total_businesses: total || 0,
-      no_website_count: no_website || 0,
+      total_businesses: total,
+      no_website_count: no_website,
       distinct_categories: categories.length,
-      last_updated: last_updated || null,
+      last_updated,
+      shard_count: shards.length,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -86,11 +135,17 @@ app.get("/api/businesses", async (req, res) => {
     if (no_website === "true") {
       where.push(`(website IS NULL OR website = '')`);
     }
-    params.push(Math.min(parseInt(limit, 10) || 100, 1000));
+    // Ask each shard for up to the full limit (not limit/N) — a business
+    // list has no meaningful cross-shard order to begin with, and asking
+    // each shard for fewer than the full limit risks returning less than
+    // `limit` total even when enough real rows exist, just unevenly
+    // spread across shards. Trim to the real limit after merging instead.
+    const capped = Math.min(parseInt(limit, 10) || 100, 1000);
+    params.push(capped);
     const sql = `SELECT * FROM businesses_readable
                  ${where.length ? "WHERE " + where.join(" AND ") : ""}
                  LIMIT $${params.length}`;
-    const rows = await query(sql, params);
+    const rows = (await queryAll(sql, params)).slice(0, capped);
     res.json({ count: rows.length, businesses: rows });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -110,18 +165,11 @@ app.get("/api/trade-area", async (req, res) => {
       });
     }
     const categories = String(category).split(",");
-    const [rows, summary] = await Promise.all([
-      query(
-        "SELECT * FROM businesses_within_radius($1, $2, $3, $4, $5, $6)",
-        [parseFloat(lat), parseFloat(lon), parseFloat(radius_miles), categories,
-          no_website_only === "true", country || null]
-      ),
-      query(
-        "SELECT * FROM businesses_trade_area_summary($1, $2, $3, $4, $5)",
-        [parseFloat(lat), parseFloat(lon), parseFloat(radius_miles), categories, country || null]
-      ),
-    ]);
-    res.json({ summary: summary?.[0] || null, businesses: rows });
+    const { businesses, summary } = await tradeAreaFanOut(
+      parseFloat(lat), parseFloat(lon), parseFloat(radius_miles),
+      categories, no_website_only === "true", country
+    );
+    res.json({ summary, businesses });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -157,23 +205,16 @@ app.post("/api/research", async (req, res) => {
     }
 
     const radiusMiles = Number(radius_miles) > 0 ? Number(radius_miles) : 3;
-    const [summaryRows, businesses] = await Promise.all([
-      query(
-        "SELECT * FROM businesses_trade_area_summary($1, $2, $3, $4, $5)",
-        [lat, lon, radiusMiles, categories, country || null]
-      ),
-      query(
-        "SELECT * FROM businesses_within_radius($1, $2, $3, $4, $5, $6)",
-        [lat, lon, radiusMiles, categories, !!no_website_only, country || null]
-      ),
-    ]);
+    const { businesses, summary } = await tradeAreaFanOut(
+      lat, lon, radiusMiles, categories, !!no_website_only, country
+    );
 
     res.json({
       address, category,
       matched_categories: categories,
       center: { lat, lon },
       radius_miles: radiusMiles,
-      summary: summaryRows?.[0] || null,
+      summary,
       businesses,
     });
   } catch (e) {

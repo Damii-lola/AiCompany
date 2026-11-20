@@ -18,8 +18,18 @@ services:
     rootDir: render-service
     buildCommand: npm install
     startCommand: npm start
+    # SHARDED: this service fans every read out across every
+    # DATABASE_URL_<N> you've set (render-service/lib/db.js discovers
+    # them automatically) and merges the results — add one env var per
+    # shard database in the Render dashboard, same numbering as the
+    # scanner's GitHub Actions secrets (.github/workflows/scan.yml). A
+    # bare DATABASE_URL still works too, as a single implicit shard.
     envVars:
-      - key: DATABASE_URL
+      - key: DATABASE_URL_1
+        sync: false
+      - key: DATABASE_URL_2
+        sync: false
+      - key: DATABASE_URL_3
         sync: false
       - key: INGEST_SECRET
         sync: false

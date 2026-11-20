@@ -6,6 +6,11 @@
 // Python scanner: resolve category/location/brand/status text to the
 // small lookup tables' integer ids with bulk, batched statements instead
 // of one query per value, then upsert businesses with resolved ids.
+//
+// SHARDED: `pool` from ./db is always the ACTIVE (highest-numbered
+// configured DATABASE_URL_N) shard's pool — every write through this
+// file lands in that one shard, never spread across shards. See lib/db.js
+// for why that's the right rule for this particular write path.
 
 const { pool } = require("./db");
 

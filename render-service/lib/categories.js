@@ -4,14 +4,20 @@
 // live, continuously-growing table). Cached briefly so every request to
 // /api/research doesn't re-scan the whole table.
 //
-// Now backed by a real SELECT DISTINCT against the small `categories`
-// lookup table directly — the old Supabase version had to pull a 50,000-
-// row sample of raw text and dedupe client-side because PostgREST has no
+// Backed by a real SELECT DISTINCT against the small `categories` lookup
+// table directly — the old Supabase version had to pull a 50,000-row
+// sample of raw text and dedupe client-side because PostgREST has no
 // native DISTINCT. A direct Postgres connection doesn't have that
 // limitation, and the categories table is tiny (one row per distinct
-// category, not per business), so this is now both simpler and exact.
+// category, not per business), so this is both simpler and exact.
+//
+// SHARDED: each shard has its OWN categories table with its OWN integer
+// ids — the same category name ("coffee shop") can be id 7 in shard 1
+// and id 3 in shard 2. That's fine here because this only ever returns
+// NAMES (never ids) to callers — fan out to every shard, union the
+// distinct name strings, done.
 
-const { query } = require("./db");
+const { queryEachShard } = require("./db");
 
 let cache = { categories: [], fetchedAt: 0 };
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes — real data changes slowly enough that this is safe
@@ -20,10 +26,14 @@ async function getRealCategories() {
   const fresh = Date.now() - cache.fetchedAt < CACHE_TTL_MS;
   if (fresh && cache.categories.length > 0) return cache.categories;
 
-  const rows = await query(
-    "SELECT name FROM categories WHERE name IS NOT NULL AND name <> '' ORDER BY name"
+  const perShard = await queryEachShard(
+    "SELECT name FROM categories WHERE name IS NOT NULL AND name <> ''"
   );
-  cache = { categories: rows.map((r) => r.name), fetchedAt: Date.now() };
+  const names = new Set();
+  for (const { rows } of perShard) {
+    for (const r of rows) names.add(r.name);
+  }
+  cache = { categories: [...names].sort(), fetchedAt: Date.now() };
   return cache.categories;
 }
 
