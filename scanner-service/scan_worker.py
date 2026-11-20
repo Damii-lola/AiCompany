@@ -386,8 +386,8 @@ def run_one_pass(release, pg, deadline=None):
     select = f"""
       id,
       {_pick(cols, ("names.primary", "names"))} AS name,
-      {_pick(cols, ("categories.primary", "categories"))} AS category,
-      {_pick(cols, ("categories.alternate", "categories"))} AS category_extra,
+      {_pick(cols, ("taxonomy.primary", "taxonomy"), ("categories.primary", "categories"))} AS category,
+      {_pick(cols, ("taxonomy.alternates[1]", "taxonomy"), ("categories.alternate", "categories"))} AS category_extra,
       {_pick(cols, ("addresses[1].freeform", "addresses"))} AS address,
       {_pick(cols, ("addresses[1].locality", "addresses"))} AS city,
       {_pick(cols, ("addresses[1].region", "addresses"))} AS region,
