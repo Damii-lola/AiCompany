@@ -47,8 +47,17 @@ async function ensureLocationIds(client, triples) {
 
 const norm = (v) => (v === null || v === undefined ? "" : String(v));
 
-async function upsertBusinesses(rows) {
-  if (rows.length === 0) return 0;
+// Postgres refuses a text value containing a NUL (0x00) byte outright —
+// strip it rather than let one bad field abort the whole batch. Same fix
+// as scan_worker.py's primary path, applied here too since this endpoint
+// takes arbitrary POSTed data from the Kaggle fallback scanner.
+function stripNul(v) {
+  return typeof v === "string" ? v.replace(/\u0000/g, "") : v;
+}
+
+async function upsertBusinesses(rawRows) {
+  if (rawRows.length === 0) return 0;
+  const rows = rawRows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, stripNul(v)])));
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -84,10 +93,13 @@ async function upsertBusinesses(rows) {
     const placeholders = values
       .map((_, i) => `(${cols.map((_c, j) => `$${i * cols.length + j + 1}`).join(",")})`)
       .join(",");
-    const updateSet = cols.filter((c) => c !== "id").map((c) => `${c} = excluded.${c}`).join(", ");
+    // Same philosophy as scan_worker.py: a business already in the table is
+    // left alone, not silently overwritten by a later re-sighting — only
+    // last_seen_at bumps, so a future targeted updater still has a real
+    // "not re-confirmed since X" signal to work from.
     await client.query(
       `INSERT INTO businesses (${cols.join(",")}) VALUES ${placeholders}
-       ON CONFLICT (id) DO UPDATE SET ${updateSet}`,
+       ON CONFLICT (id) DO UPDATE SET last_seen_at = excluded.last_seen_at`,
       values.flat()
     );
 

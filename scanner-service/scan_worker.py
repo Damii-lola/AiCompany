@@ -240,20 +240,26 @@ def pg_upsert_businesses(pg, lookups, records):
     with pg.cursor() as cur:
         for i in range(0, len(rows), INGEST_BATCH_SIZE):
             batch = rows[i:i + INGEST_BATCH_SIZE]
+            # ON CONFLICT only bumps last_seen_at, nothing else — a business
+            # already in the table is left alone (its name/category/address/
+            # etc. never get silently overwritten by a later re-scan). That's
+            # by design: this scanner's job is "find it and add it once,"
+            # not "keep re-verifying it." Real-world changes to an existing
+            # business (ownership transfer, closed down, moved) are a job
+            # for a separate targeted updater to build later — one that
+            # checks specific businesses on purpose, not a side effect of
+            # re-walking the same tiles. last_seen_at is still bumped on
+            # every re-sighting specifically so that future updater has a
+            # real "not re-confirmed since X" signal to work from — if this
+            # went to DO NOTHING entirely, last_seen_at would always equal
+            # first_seen_at and that signal would be lost.
             psycopg2.extras.execute_values(cur, """
                 INSERT INTO businesses (
                     id, name, category_id, category_extra_id, address, location_id,
                     postcode, phone, website, email, social, brand_id, confidence,
                     status_id, lon, lat, last_seen_at
                 ) VALUES %s
-                ON CONFLICT (id) DO UPDATE SET
-                    name = excluded.name, category_id = excluded.category_id,
-                    category_extra_id = excluded.category_extra_id, address = excluded.address,
-                    location_id = excluded.location_id, postcode = excluded.postcode,
-                    phone = excluded.phone, website = excluded.website, email = excluded.email,
-                    social = excluded.social, brand_id = excluded.brand_id,
-                    confidence = excluded.confidence, status_id = excluded.status_id,
-                    lon = excluded.lon, lat = excluded.lat, last_seen_at = excluded.last_seen_at
+                ON CONFLICT (id) DO UPDATE SET last_seen_at = excluded.last_seen_at
             """, batch)
 
 
@@ -327,6 +333,19 @@ def scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1, depth=0):
             # quirk: NaN always becomes JSON null, which json.loads() always
             # turns back into a real Python None, for every dtype.
             records = json.loads(df.to_json(orient="records"))
+            # Postgres categorically refuses a text value containing a NUL
+            # (0x00) byte — not a validation choice, it's a hard limitation
+            # of how it stores text internally. Overture's free-text fields
+            # (name/address especially) occasionally carry garbage bytes
+            # from whatever source scraped them, and a single bad byte in
+            # one record otherwise aborts the ENTIRE batch it's bundled
+            # into, including however many thousands of good records share
+            # that batch — strip it up front rather than let one corrupt
+            # record cost the rest of the tile's data.
+            records = [
+                {k: (v.replace("\x00", "") if isinstance(v, str) else v) for k, v in r.items()}
+                for r in records
+            ]
             pg_upsert_businesses(pg, lookups, records)
         return n
     except Exception as e:
