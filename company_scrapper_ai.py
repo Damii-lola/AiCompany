@@ -8,71 +8,72 @@ pre-screening specifically (trade-area competitor counts, no-website
 breakdown), but built generally enough that Basic/Advance Researcher can
 reuse the same tool layer later.
 
+This is the "addon to the template AI" that turns a plain-English request
+into a real query against the live database: a user types what they want,
+this worker (base Qwen + the fresh template adapter, no worker adapter of
+its own — see below for why) extracts the structured pieces of the
+request, picks real category matches from the REAL live category list
+(never invents one), and hands back real files — CSV/XLSX/PDF — built from
+actual rows, never a model-generated guess at what the data contains.
+
 WHY NO WORKER ADAPTER (explicit judgment call, per the standing allowance
 "this is something that might not need finetuning but if u feel it does,
 then we can finetune it"):
 This AI's actual job is turning a loose request into exact calls against
 REAL deterministic tools — geocoding, radius math, and matching plain-English
-category words to the REAL category strings Overture Maps actually uses
-(e.g. a user says "dentist", the database only ever has "dental_clinic").
-Every one of those steps has a verifiable right answer that already lives in
-code or in the real distinct-category list pulled live from the database —
-none of it is a question of "sound more like an SBA analyst," which is what
-fine-tuning would actually buy. Baking "dentist -> dental_clinic" into model
-weights would be strictly worse than just handing the model the real list and
-having it pick from THAT, because the list can grow or change and weights
-can't update themselves. So this script is inference + real tool-calling on
-the CURRENT template (pulled fresh every run, same as every worker), with NO
-training loop and no adapter of its own. If real use later shows the model
-consistently mis-parsing a particular kind of SBA request in a way that more
-tool code can't fix (not "needs nicer phrasing" but "needs judgment"), THAT's
-the moment to come back and give it a worker_fine_tune.py pass with real
-labeled (request -> correct spec) examples via the fork_worker_ai.py pattern
-— not before, and not speculatively.
+category words to the REAL category strings the live database actually
+uses (e.g. a user says "dentist", the database only ever has
+"dental clinic"). Every one of those steps has a verifiable right answer
+that already lives in code or in the real distinct-category list pulled
+live from the database — none of it is a question of "sound more like an
+SBA analyst," which is what fine-tuning would actually buy. Baking
+"dentist -> dental clinic" into model weights would be strictly worse than
+just handing the model the real list and having it pick from THAT, because
+the list can grow or change and weights can't update themselves. So this
+script is inference + real tool-calling on the CURRENT template (pulled
+fresh every run, same as every worker), with NO training loop and no
+adapter of its own. If real use later shows the model consistently
+mis-parsing a particular kind of SBA request in a way that more tool code
+can't fix (not "needs nicer phrasing" but "needs judgment"), THAT's the
+moment to come back and give it a worker_fine_tune.py pass with real
+labeled (request -> correct spec) examples via the fork_worker_ai.py
+pattern — not before, and not speculatively.
 
-WHAT THIS INTEGRATES (the three pieces of infrastructure this project
-already had, now wired together):
-  1. kaggle_business_scanner.py  -> produces business_database.parquet
-     (Kaggle Dataset `global-businesses-v1`; stays on Kaggle, not GitHub —
-     this file is genuinely too large for GitHub's 100MB limit, unlike the
-     small model checkpoints, and reads from Kaggle Datasets have always
-     worked fine; only writes were ever broken, and that's now hardened to
-     fail loud instead of silently in kaggle_business_scanner.py itself)
-  2. service_sba_trade_area_snapshot.py -> real radius-based competitor
-     queries + geocoding (the capability that was missing before this)
-  3. service_lead_research_report.py -> the exact-match (non-radius) query
-     path, for requests that aren't trade-area shaped
-  4. The CURRENT template model (pulled fresh from the GitHub repo, same as
-     every worker) -> parses the free-text request and picks real category
-     matches from the real list, nothing invented
-
-"ACTIVELY AND ALWAYS CHECKS CONSTANTLY" — HONEST IMPLEMENTATION:
-Overture Maps publishes a new release roughly monthly, not continuously —
-an actual infinite loop against a data source that only changes once a
-month would burn GPU/compute hours checking nothing new, which is exactly
-the kind of dishonest-looking-busy behavior this project doesn't do. What
-"always checking" means here, for real: every time this script runs (which
-can itself be wired to a Kaggle scheduled notebook run, e.g. daily),
-check_for_new_release() compares the latest real Overture STAC release
-against the one recorded from the last scan. If it's genuinely new, it
-flags that a re-scan is due (and can kick one off) instead of silently
-running on stale data forever. That is the honest version of "constantly
-checking" for a source that updates on its own real-world schedule.
+WHAT THIS INTEGRATES:
+  1. render-service's live HTTP API (aicompany-tmg7.onrender.com) — the
+     real, continuously-correct source of truth: ~18.8M real US+territory
+     businesses, sharded across multiple Prisma Postgres databases, kept
+     current by scanner-service/scan_worker.py on its own GitHub Actions
+     schedule. THIS script has zero responsibility for scanning or
+     freshness anymore, it only ever reads. (Superseded Nov 2026: this
+     used to pull a Kaggle-Dataset parquet snapshot and track its own
+     "is a rescan due" state against Overture's STAC release feed — that
+     whole architecture is gone along with Kaggle-as-the-scanner. Live
+     Postgres behind an API is always current; there is no snapshot here
+     to go stale and nothing left for this script to track.)
+  2. service_sba_trade_area_snapshot.py — thin client over that same live
+     API: real radius-based competitor queries + geocoding.
+  3. service_lead_research_report.py — the exact-match (non-radius) query
+     path, for requests that aren't trade-area shaped.
+  4. The CURRENT template model (pulled fresh from the GitHub repo, same
+     as every worker) — parses the free-text request and picks real
+     category matches from the real, live category list, nothing invented.
 """
 
 # %% Install
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-get_ipython().system('pip install -q -U transformers accelerate "bitsandbytes>=0.46.1" peft duckdb pandas pyarrow kaggle requests')
+get_ipython().system('pip install -q -U transformers accelerate "bitsandbytes>=0.46.1" peft requests')
 
 # %% Config
-import json, time, glob, shutil, re, subprocess, difflib
+import json, time, shutil, re, subprocess, difflib
 import torch
 
 BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 
-# Namespace for this AI's OWN small bits of state in the repo (a release
-# marker, request logs) — not an adapter, since none is trained (see docstring).
+# Namespace for this AI's own bits (none persisted right now — see docstring:
+# this worker has no state of its own left to track since freshness/scanning
+# moved entirely to scan_worker.py).
 WORKER_SLUG = "researchers-company-scrapper"
 
 GITHUB_REPO_SLUG = "Damii-lola/AiCompany"
@@ -80,11 +81,14 @@ GITHUB_REPO_URL = f"https://github.com/{GITHUB_REPO_SLUG}"
 GITHUB_USERNAME = "Damii-lola"
 LOCAL_REPO_DIR = "/kaggle/working/_repo"
 TEMPLATE_REPO_PATH = "model"
-STATE_REPO_PATH = f"workers/{WORKER_SLUG}/state.json"   # last-scanned release marker lives here
 TEMPLATE_DIR = "/kaggle/working/_template_adapter"
 
-BIZ_DATASET_SLUG = "global-businesses-v1"   # same dataset kaggle_business_scanner.py pushes to
-BIZ_DB_LOCAL = "/kaggle/working/_biz/business_database.parquet"
+# The live read API (render-service) — same URL the GitHub Pages dashboard
+# and service_sba_trade_area_snapshot.py call. Sharded behind the scenes
+# (render-service/lib/db.js fans out across every configured
+# DATABASE_URL_N and merges), none of which this script needs to know
+# about — it's one URL from here.
+RENDER_API_BASE = "https://aicompany-tmg7.onrender.com"
 
 # %% GitHub permanent storage — same git helpers every other script here uses
 from kaggle_secrets import UserSecretsClient
@@ -112,34 +116,7 @@ def clone_repo_fresh():
     return LOCAL_REPO_DIR
 
 
-def push_repo_changes(commit_message):
-    token = _s.get_secret("GITHUB_TOKEN")
-    push_url = f"https://{GITHUB_USERNAME}:{token}@github.com/{GITHUB_REPO_SLUG}.git"
-    _run_git(["git", "add", "-A"], cwd=LOCAL_REPO_DIR)
-    diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=LOCAL_REPO_DIR)
-    if diff.returncode == 0:
-        print("  -> no changes to push (content identical)")
-        return True
-    _run_git(["git", "-c", "user.email=ai@autonomous.local", "-c", "user.name=Autonomous AI",
-              "commit", "-m", commit_message], cwd=LOCAL_REPO_DIR)
-    try:
-        _run_git(["git", "push", push_url, "HEAD:main"], cwd=LOCAL_REPO_DIR)
-    except RuntimeError:
-        print("  -> push rejected (remote moved since clone) — fetching latest and rebasing once...")
-        _run_git(["git", "fetch", push_url, "main"], cwd=LOCAL_REPO_DIR)
-        _run_git(["git", "rebase", "FETCH_HEAD"], cwd=LOCAL_REPO_DIR)
-        _run_git(["git", "push", push_url, "HEAD:main"], cwd=LOCAL_REPO_DIR)
-    print(f"  -> pushed to {GITHUB_REPO_SLUG}")
-    return True
-
-
 repo_dir = clone_repo_fresh()
-
-print("\nVerifying write access to the permanent repo before doing anything else...")
-with open(os.path.join(repo_dir, ".last_write_check"), "w") as f:
-    f.write(f"write-access check at {time.time()}\n")
-push_repo_changes("write-access check (auto, no content changed)")
-print("WRITE ACCESS CONFIRMED.\n")
 
 # %% Pull the template — ALWAYS fresh, every run, read-only here. This AI
 # reasons with whatever the template's current best state is, automatically.
@@ -154,77 +131,6 @@ shutil.copytree(template_src, TEMPLATE_DIR)
 with open(os.path.join(TEMPLATE_DIR, "training_progress.json")) as f:
     template_steps = json.load(f).get("total_steps")
 print(f"Pulled the CURRENT template — cumulative {template_steps:,} steps as of right now.")
-
-# %% Pull this AI's own small state file (last-scanned release marker), if any
-state_src = os.path.join(repo_dir, STATE_REPO_PATH)
-state = {"last_scanned_release": None}
-if os.path.exists(state_src):
-    with open(state_src) as f:
-        state = json.load(f)
-    print(f"Loaded prior state: last scanned release = {state.get('last_scanned_release')}")
-else:
-    print("No prior state found — this is this AI's first run.")
-
-
-def save_state():
-    dest = os.path.join(repo_dir, STATE_REPO_PATH)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    with open(dest, "w") as f:
-        json.dump(state, f, indent=2)
-    push_repo_changes(f"Company Scrapper: state update, last_scanned_release={state.get('last_scanned_release')}")
-
-# %% Pull the real business database (Kaggle Dataset — large binary data,
-# stays on Kaggle; reads from Kaggle Datasets have always worked fine, it was
-# only WRITES that were ever broken, and that's a separate dataset/problem
-# from the model checkpoint anyway)
-os.environ["KAGGLE_USERNAME"] = _s.get_secret("KAGGLE_USERNAME")
-os.environ["KAGGLE_KEY"] = _s.get_secret("KAGGLE_KEY")
-from kaggle.api.kaggle_api_extended import KaggleApi
-kapi = KaggleApi(); kapi.authenticate()
-BIZ_OWNER = os.environ["KAGGLE_USERNAME"]
-
-os.makedirs(os.path.dirname(BIZ_DB_LOCAL), exist_ok=True)
-print(f"\nPulling the business database ({BIZ_OWNER}/{BIZ_DATASET_SLUG})...")
-kapi.dataset_download_files(f"{BIZ_OWNER}/{BIZ_DATASET_SLUG}",
-                             path=os.path.dirname(BIZ_DB_LOCAL), unzip=True, quiet=False)
-found = glob.glob(f"{os.path.dirname(BIZ_DB_LOCAL)}/**/*.parquet", recursive=True)
-assert found, (f"No .parquet file found after pulling {BIZ_OWNER}/{BIZ_DATASET_SLUG} — "
-               f"run kaggle_business_scanner.py at least once first.")
-BIZ_DB_LOCAL = found[0]
-print(f"Business database ready: {BIZ_DB_LOCAL}")
-
-# %% Check for a new Overture release — honest version of "always checking"
-import requests
-
-
-def check_for_new_release():
-    """Compares the real current Overture STAC release against the one
-    recorded from the last scan. Returns (is_new, latest_release_id).
-    This is the honest form of 'constantly checking' for a source that only
-    actually changes about once a month — no meaningless infinite loop."""
-    try:
-        r = requests.get("https://stac.overturemaps.org/catalog.json", timeout=30).json()
-        latest = r["latest"]
-    except Exception as e:
-        print(f"Release check failed ({e}) — treating as 'no new release known' rather than guessing.")
-        return False, state.get("last_scanned_release")
-    is_new = state.get("last_scanned_release") not in (None, latest)
-    return is_new, latest
-
-
-is_new, latest_release = check_for_new_release()
-if state.get("last_scanned_release") is None:
-    print(f"First run — current Overture release is {latest_release}. "
-          f"(kaggle_business_scanner.py should be run against this release if it hasn't been yet.)")
-elif is_new:
-    print(f"\n*** NEW OVERTURE RELEASE AVAILABLE: {latest_release} "
-          f"(last scan used {state['last_scanned_release']}) ***")
-    print("Re-run kaggle_business_scanner.py to pick up the new release before relying on "
-          "results here for anything time-sensitive — this script does not silently keep "
-          "serving stale data without telling you.")
-else:
-    print(f"Business data is current (release {latest_release}, matches last scan).")
-state["last_scanned_release"] = latest_release
 
 # %% Load base model in 4-bit + the current template adapter (inference only
 # — no training, no worker adapter; see docstring for why)
@@ -256,21 +162,17 @@ def generate(prompt, max_new_tokens=400, temperature=0.2):
                               temperature=max(temperature, 1e-5), top_p=0.9)
     return tokenizer.decode(out[0][inputs.shape[1]:], skip_special_tokens=True).strip()
 
-# %% Real category taxonomy — pulled LIVE from the actual database, never
-# invented. This is what makes "search so much better" real: the model picks
-# from what the data actually contains, instead of guessing a category
-# string that sounds right but doesn't exist (which would silently return
-# zero rows and look like a bug).
-import duckdb
+# %% Real category taxonomy — pulled LIVE from the actual live database via
+# render-service's API, never invented and never a stale local snapshot.
+# This is what makes "search so much better" real: the model picks from
+# what the data actually contains right now, instead of guessing a
+# category string that sounds right but doesn't exist (which would
+# silently return zero rows and look like a bug).
+import requests
 
-_con = duckdb.connect()
-_con.execute(f"CREATE VIEW biz AS SELECT * FROM read_parquet('{BIZ_DB_LOCAL}')")
-REAL_CATEGORIES = sorted(
-    r[0] for r in _con.execute(
-        "SELECT DISTINCT category FROM biz WHERE category IS NOT NULL"
-    ).fetchall()
-)
-_con.close()
+_cat_resp = requests.get(f"{RENDER_API_BASE}/api/categories", timeout=30)
+_cat_resp.raise_for_status()
+REAL_CATEGORIES = sorted(_cat_resp.json()["categories"])
 print(f"Loaded {len(REAL_CATEGORIES):,} real distinct category values from the live database.")
 
 
@@ -279,14 +181,22 @@ def match_categories(plain_english_term, top_k=5):
     REAL category strings in the database. Two-stage, both grounded in the
     real list — never a free-form guess:
       1. difflib close-match against the real list (fast, catches obvious
-         matches like 'dentist' -> 'dental_clinic')
+         matches like 'dentist' -> 'dental clinic')
       2. the model picks from a shortlist combining close matches + a
          sample of the full list, forced to answer ONLY with values that
          are actually in REAL_CATEGORIES (checked after, not trusted blindly)
     Returns a list of real category strings, never a fabricated one."""
     term = plain_english_term.strip().lower()
     close = difflib.get_close_matches(term, REAL_CATEGORIES, n=top_k, cutoff=0.3)
-    token_matches = [c for c in REAL_CATEGORIES if term.replace(" ", "_") in c or term in c.replace("_", " ")]
+    # Overture's real taxonomy values are typically snake_case ("coffee_shop",
+    # "dental_clinic"), but this is matched defensively against BOTH that and
+    # a plain space-separated form — rather than assume one convention, since
+    # getting this wrong silently misses real matches instead of erroring.
+    term_us, term_sp = term.replace(" ", "_"), term.replace("_", " ")
+    token_matches = [
+        c for c in REAL_CATEGORIES
+        if term in c or term_us in c or term_sp in c or c in term or c.replace("_", " ") in term
+    ]
     shortlist = list(dict.fromkeys(close + token_matches))[:15]
 
     if not shortlist:
@@ -318,7 +228,8 @@ def parse_request(nl_request: str) -> dict:
     """Extracts the structured pieces of an SBA trade-area request from
     free text. The model's job here is ONLY extraction (what did the user
     ask for), never deciding the answer — the actual competitor numbers
-    always come from the real DuckDB query downstream, not from the model."""
+    always come from the real live database downstream, not from the
+    model."""
     prompt = (
         "Extract the following fields from this business research request as JSON, "
         "with keys exactly: address (string or null), radius_miles (number or null), "
@@ -338,7 +249,14 @@ def research(nl_request: str, output_formats=None, out_dir="./company_scrapper_o
     """The main entry point: plain-English request in, real results out.
     Every field in the returned spec either came from the user's own words
     or was validated against real data (real geocode, real category match,
-    real row counts) — nothing here is invented to fill a gap."""
+    real row counts) — nothing here is invented to fill a gap.
+
+    Geocodes + queries by EXACT coordinates/category (service_sba_trade_area
+    _snapshot's form (b)) rather than letting render-service's own fuzzy
+    matching run a second time — this worker's whole value-add over a bare
+    API call is doing that category matching WITH the model's judgment
+    (match_categories above), so by the time we call the live API we
+    already have the real, validated category string(s)."""
     parsed = parse_request(nl_request)
     print(f"Parsed request: {parsed}")
 
@@ -359,16 +277,17 @@ def research(nl_request: str, output_formats=None, out_dir="./company_scrapper_o
         "radius_miles": parsed.get("radius_miles") or 3,
         "category": categories,
         "country": parsed.get("country"),
+        "no_website_only": bool(parsed.get("no_website_only")),
         "output_formats": output_formats or ["csv", "pdf"],
+        "api_base": RENDER_API_BASE,
     }
-    preview = sba.preview_trade_area(spec, BIZ_DB_LOCAL)
+    preview = sba.preview_trade_area(spec)
     print(f"Preview: {preview}")
-    files = sba.fulfil(spec, BIZ_DB_LOCAL, out_dir)
+    files = sba.fulfil(spec, out_dir)
     return {"spec": spec, "preview": preview, "files": files}
 
-# %% Push the updated state (release marker) and finish
-save_state()
+
 print(f"\nCompany Scrapper ready. template@{template_steps:,}, "
-      f"{len(REAL_CATEGORIES):,} real categories loaded, business DB at {BIZ_DB_LOCAL}.\n"
+      f"{len(REAL_CATEGORIES):,} real categories loaded live from {RENDER_API_BASE}.\n"
       f"Call research(\"find dental clinics with no website within 3 miles of 123 Main St, "
       f"Columbus, OH\") to run a real request.")
