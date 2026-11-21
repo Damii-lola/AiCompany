@@ -2,54 +2,78 @@
 Service execution module: SBA Trade-Area Competitor Snapshot
 ==============================================================
 Second "fulfilment_module" in the platform (see service_lead_research_report.py
-for the pattern this follows exactly: `fulfil(spec, db_path, out_dir) -> list[file_path]`,
+for the pattern this follows: `fulfil(spec, out_dir) -> list[file_path]`,
 nothing fabricated, SpecError raised rather than guessed around).
 
-This is the real missing piece for the SBA feasibility pre-screening product
-(locked V1 definition): "competitor count/list by category within a
-radius-based trade area, plus a no-website breakdown." The existing lead
-report module only supports exact-match category/country/region/city
-filters — it has NO notion of distance. A trade area is a circle around a
-proposed business address, not an administrative boundary, so this module
-adds real radius (great-circle distance) filtering on top of the same
-underlying business_database.parquet (which already has real lon/lat
-columns — confirmed from kaggle_business_scanner.py's SELECT clause).
+This is the real locked V1 SBA feasibility pre-screening product:
+"competitor count/list by category within a radius-based trade area, plus
+a no-website breakdown." Sold to community-bank/credit-union SBA 7(a)/504
+lenders as a fast $200-$500 pre-screen before they order a full $4,900
+feasibility study from an incumbent like MMCG.
 
-Usage:
-    spec = {
-        "center_lat": 39.9612,              # required: trade-area center
-        "center_lon": -82.9988,             # required
-        "radius_miles": 3,                  # required
-        "category": "dental_clinic",        # required: competitor category, or list
-        "country": "US",                    # optional, same filters as the lead report module
-        "output_formats": ["csv", "pdf"],
-    }
-    files = fulfil(spec, db_path="business_database.parquet", out_dir="./deliverables/sba_job123")
+DATA SOURCE (changed Nov 2026): this used to query a local
+business_database.parquet file directly with DuckDB. That file doesn't
+exist anymore — the real data now lives in the live, sharded Prisma
+Postgres setup (database/schema.sql, scanner-service/scan_worker.py,
+render-service), which already did the one-time US+territories backfill
+(~18.8M real rows across however many shard databases are configured).
+This module is now a thin client against render-service's live HTTP API
+(the same API the GitHub Pages dashboard calls) instead of re-implementing
+radius/category SQL against a file — render-service already does the
+real work (geocoding, category matching, radius search, cross-shard
+merge-sort by real distance) and exposes it as JSON.
 
-    # or, if you only have a street address and not coordinates yet:
-    lat, lon = geocode_address("123 Main St, Columbus, OH")
+Two ways to call fulfil(), matching the two ways render-service itself
+supports a trade-area lookup:
+
+  (a) Loose address + plain-English category (recommended — this is what
+      a non-technical operator would actually have on hand): server
+      geocodes the address (Nominatim) and fuzzy-matches the category
+      term against the live distinct category list.
+        spec = {
+            "address": "123 Main St, Columbus, OH",
+            "category": "dental clinic",
+            "radius_miles": 3,
+        }
+
+  (b) Exact coordinates + exact real category string(s) (for a caller
+      that already has precise data, e.g. a previous geocode result or a
+      category pulled straight from /api/categories): no fuzzy matching,
+      no geocoding round-trip.
+        spec = {
+            "center_lat": 39.9612, "center_lon": -82.9988,
+            "category": ["dental clinic", "orthodontist"],
+            "radius_miles": 3,
+        }
+
+Common optional spec fields (either form): country, no_website_only,
+exclude_categories (list, applied client-side — render-service's API has
+no concept of this), operating_status_open_only (client-side too),
+output_formats (default ["csv"]), api_base (override the render-service
+URL, default below).
 """
 
 import os
 import json
-import time
-import duckdb
+import requests
 import pandas as pd
 from datetime import datetime, timezone
 
-from service_lead_research_report import SpecError, _normalize_phone, _COUNTRY_CALLING_CODE
+from service_lead_research_report import SpecError, _normalize_phone
 
-EARTH_RADIUS_MILES = 3958.7613
+# The live read API (render-service) — same URL the GitHub Pages
+# dashboard calls. Overridable per-call via spec["api_base"] for a local
+# render-service instance during testing.
+DEFAULT_API_BASE = "https://aicompany-tmg7.onrender.com"
 
 
 def geocode_address(address: str, timeout: int = 15) -> tuple:
-    """Turns a free-text address into (lat, lon) using OpenStreetMap's Nominatim
-    (no API key, but rate-limited and best-effort — real geocoding, not a guess).
-    Raises SpecError if it can't resolve the address rather than returning a
-    plausible-looking wrong coordinate. Requires outbound internet access from
-    wherever this runs; if that's not available, pass center_lat/center_lon
-    directly in the spec instead of calling this."""
-    import requests
+    """Turns a free-text address into (lat, lon) using OpenStreetMap's
+    Nominatim directly (no API key, best-effort). Only needed if a caller
+    wants raw coordinates for some OTHER purpose — fulfil() itself prefers
+    to let render-service's /api/research do this server-side (form (a)
+    above) rather than geocoding twice. Raises SpecError rather than
+    returning a plausible-looking wrong coordinate."""
     headers = {"User-Agent": "sba-trade-area-snapshot/1.0 (internal tool)"}
     params = {"q": address, "format": "json", "limit": 1}
     try:
@@ -65,144 +89,159 @@ def geocode_address(address: str, timeout: int = 15) -> tuple:
     return float(results[0]["lat"]), float(results[0]["lon"])
 
 
-def _distance_expr(center_lat: float, center_lon: float) -> str:
-    """Great-circle (haversine via acos/cos/sin) distance in miles from the
-    trade-area center to each row's lon/lat. Real spherical-earth formula,
-    not a flat-plane approximation — matters at the radii SBA jobs use
-    (1-10 miles) just as much as it would at longer range, since DuckDB
-    computes it exactly the same either way for free."""
-    return (
-        f"({EARTH_RADIUS_MILES} * acos(least(1.0, greatest(-1.0, "
-        f"cos(radians({center_lat})) * cos(radians(lat)) * "
-        f"cos(radians(lon) - radians({center_lon})) + "
-        f"sin(radians({center_lat})) * sin(radians(lat))"
-        f"))))"
-    )
+def _require(spec: dict, *fields):
+    missing = [f for f in fields if spec.get(f) in (None, "", [])]
+    if missing:
+        raise SpecError(f"Trade-area spec is missing required field(s): {', '.join(missing)}.")
 
 
-def _build_trade_area_where(spec: dict) -> tuple:
-    """Same filter vocabulary as service_lead_research_report._build_where
-    (category/country/region/city/no_website/has_phone/has_email), plus the
-    mandatory radius clause this module exists to add. Kept as its own
-    function rather than importing _build_where directly because the radius
-    clause has to be injected alongside it, not after — DuckDB needs lon/lat
-    IS NOT NULL checked before the distance math runs on a row."""
-    for required in ("center_lat", "center_lon", "radius_miles", "category"):
-        if spec.get(required) in (None, "", []):
-            raise SpecError(f"Trade-area spec is missing required field '{required}'.")
+def _fetch_trade_area(spec: dict) -> dict:
+    """Calls the live render-service API and returns its JSON response
+    verbatim ({summary, businesses, ...}). Raises SpecError on anything
+    that isn't a clean 200 — a network failure, a bad address, or a
+    category that matched nothing are all real conditions a caller needs
+    to know about, not something to paper over."""
+    api_base = spec.get("api_base", DEFAULT_API_BASE).rstrip("/")
+    _require(spec, "radius_miles", "category")
 
-    clauses = ["lon IS NOT NULL", "lat IS NOT NULL"]
-    params = []
+    if spec.get("address"):
+        if not isinstance(spec["category"], str):
+            raise SpecError(
+                "When using 'address' (form (a), loose/plain-English lookup), "
+                "'category' must be a single plain-English string — render-service's "
+                "/api/research fuzzy-matches it server-side. Pass 'center_lat'/'center_lon' "
+                "plus an exact category string or list instead (form (b)) if you already "
+                "have precise coordinates/category names."
+            )
+        try:
+            r = requests.post(f"{api_base}/api/research", json={
+                "address": spec["address"],
+                "category": spec["category"],
+                "radius_miles": spec["radius_miles"],
+                "no_website_only": bool(spec.get("no_website_only", False)),
+                "country": spec.get("country"),
+            }, timeout=30)
+        except Exception as e:
+            raise SpecError(f"Could not reach the live business database at {api_base}: {e}") from e
+        if r.status_code == 422:
+            body = r.json()
+            raise SpecError(
+                f"{body.get('error', 'Category did not match anything real.')} "
+                f"Real category examples: {body.get('real_category_sample', [])[:10]}"
+            )
+        if not r.ok:
+            raise SpecError(f"Live business database returned {r.status_code}: {r.text[:500]}")
+        return r.json()
 
-    dist = _distance_expr(spec["center_lat"], spec["center_lon"])
-    clauses.append(f"{dist} <= ?")
-    params.append(spec["radius_miles"])
-
+    _require(spec, "center_lat", "center_lon")
     cat = spec["category"]
     cats = [cat] if isinstance(cat, str) else list(cat)
-    clauses.append(f"category IN ({','.join(['?'] * len(cats))})")
-    params.extend(cats)
+    try:
+        r = requests.get(f"{api_base}/api/trade-area", params={
+            "lat": spec["center_lat"], "lon": spec["center_lon"],
+            "radius_miles": spec["radius_miles"], "category": ",".join(cats),
+            "no_website_only": "true" if spec.get("no_website_only") else "false",
+            "country": spec.get("country") or "",
+        }, timeout=30)
+    except Exception as e:
+        raise SpecError(f"Could not reach the live business database at {api_base}: {e}") from e
+    if not r.ok:
+        raise SpecError(f"Live business database returned {r.status_code}: {r.text[:500]}")
+    return r.json()
 
+
+def _apply_client_side_filters(df: pd.DataFrame, spec: dict) -> pd.DataFrame:
+    """Filters render-service has no notion of (exclude_categories,
+    operating_status_open_only) — applied here, after the fact, against
+    the real rows the API returned. Everything downstream (counts,
+    no-website breakdown, by-category table, nearest-competitor) is then
+    computed from THIS filtered frame, same as before this module talked
+    to a live API instead of a local file — stats were always derived
+    from the actual result set, never from a separately-trusted count."""
     if spec.get("exclude_categories"):
         ex = spec["exclude_categories"]
-        ex = [ex] if isinstance(ex, str) else list(ex)
-        clauses.append(f"category NOT IN ({','.join(['?'] * len(ex))})")
-        params.extend(ex)
-
-    if spec.get("country"):
-        clauses.append("country = ?")
-        params.append(spec["country"])
-
-    if spec.get("region"):
-        clauses.append("region = ?")
-        params.append(spec["region"])
-
-    if spec.get("city"):
-        clauses.append("city = ?")
-        params.append(spec["city"])
-
+        ex = {ex} if isinstance(ex, str) else set(ex)
+        df = df[~df["category"].isin(ex)]
     if spec.get("operating_status_open_only"):
-        clauses.append("(operating_status IS NULL OR lower(operating_status) NOT IN ('closed', 'permanently_closed'))")
-
-    return " AND ".join(clauses), params, dist
-
-
-def preview_trade_area(spec: dict, db_path: str) -> dict:
-    """Real counts, no padding — call this before promising a client anything.
-    Returns total competitor count AND the no-website count, since that's the
-    second half of the locked V1 product (competitors + no-website breakdown),
-    not just a raw row count."""
-    con = duckdb.connect()
-    con.execute(f"CREATE VIEW biz AS SELECT * FROM read_parquet('{db_path}')")
-    where, params, dist = _build_trade_area_where(spec)
-
-    total = con.execute(f"SELECT count(*) FROM biz WHERE {where}", params).fetchone()[0]
-    no_site = con.execute(
-        f"SELECT count(*) FROM biz WHERE {where} AND (website IS NULL OR trim(website) = '')",
-        params,
-    ).fetchone()[0]
-    con.close()
-    return {"competitor_count": total, "no_website_count": no_site,
-            "radius_miles": spec["radius_miles"], "category": spec["category"]}
+        closed = {"closed", "permanently_closed"}
+        df = df[df["operating_status"].isna() | ~df["operating_status"].str.lower().isin(closed)]
+    return df
 
 
-def fulfil(spec: dict, db_path: str, out_dir: str) -> list:
-    """Produces the trade-area competitor snapshot deliverable(s). Returns the
-    list of file paths actually written. Raises SpecError on zero matches
-    rather than delivering an empty file that looks like a bug."""
+def preview_trade_area(spec: dict) -> dict:
+    """Real counts, no padding — call this before promising a client
+    anything. Hits the live API and reports what's actually there."""
+    result = _fetch_trade_area(spec)
+    df = pd.DataFrame(result["businesses"])
+    if not df.empty:
+        df = _apply_client_side_filters(df, spec)
+    return {
+        "competitor_count": len(df),
+        "no_website_count": int((df["website"].isna() | (df["website"].str.strip() == "")).sum()) if not df.empty else 0,
+        "radius_miles": spec["radius_miles"],
+        "category": spec["category"],
+        "matched_categories": result.get("matched_categories"),
+        "center": result.get("center"),
+    }
+
+
+def fulfil(spec: dict, out_dir: str) -> list:
+    """Produces the trade-area competitor snapshot deliverable(s) from
+    the LIVE sharded database. Returns the list of file paths actually
+    written. Raises SpecError on zero matches rather than delivering an
+    empty file that looks like a bug."""
     os.makedirs(out_dir, exist_ok=True)
 
-    con = duckdb.connect()
-    con.execute(f"CREATE VIEW biz AS SELECT * FROM read_parquet('{db_path}')")
-    where, params, dist = _build_trade_area_where(spec)
-
-    cols_to_select = (
-        f"name, category, address, city, region, postcode, country, phone, "
-        f"website, email, social, brand, operating_status, lat, lon, "
-        f"{dist} AS distance_miles"
-    )
-    df = con.execute(
-        f"SELECT {cols_to_select} FROM biz WHERE {where} ORDER BY distance_miles ASC",
-        params,
-    ).df()
-    con.close()
+    result = _fetch_trade_area(spec)
+    df = pd.DataFrame(result["businesses"])
+    if not df.empty:
+        df = _apply_client_side_filters(df, spec)
 
     if df.empty:
         raise SpecError(
             f"Zero competitors found for category={spec['category']!r} within "
-            f"{spec['radius_miles']} miles of ({spec['center_lat']}, {spec['center_lon']}). "
-            f"Either the trade area genuinely has none (a real, reportable finding — "
-            f"widen the radius or confirm with the client before treating this as an error) "
-            f"or the category string doesn't match what's in the database."
+            f"{spec['radius_miles']} miles. Either the trade area genuinely has none "
+            f"(a real, reportable finding — widen the radius or confirm with the client "
+            f"before treating this as an error) or the category/address didn't resolve "
+            f"to what you expected — matched_categories/center in the API response "
+            f"(not available here since there were zero rows) would normally confirm that."
         )
 
     df["phone"] = df["phone"].apply(lambda p: _normalize_phone(p, spec.get("country")))
     df["distance_miles"] = df["distance_miles"].round(2)
+    df = df.sort_values("distance_miles").reset_index(drop=True)
 
-    no_website = df[df["website"].isna() | (df["website"].str.strip() == "")]
+    no_website = df[df["website"].isna() | (df["website"].astype(str).str.strip() == "")]
     by_category = df["category"].value_counts()
 
     files = []
     formats = spec.get("output_formats", ["csv"])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
 
+    export_cols = ["name", "category", "category_extra", "address", "city", "region",
+                   "postcode", "country", "phone", "website", "email", "social", "brand",
+                   "operating_status", "lat", "lon", "distance_miles"]
+    export_cols = [c for c in export_cols if c in df.columns]
+
     if "csv" in formats:
         path = os.path.join(out_dir, f"trade_area_competitors_{stamp}.csv")
-        df.to_csv(path, index=False)
+        df[export_cols].to_csv(path, index=False)
         files.append(path)
 
     if "xlsx" in formats:
         path = os.path.join(out_dir, f"trade_area_competitors_{stamp}.xlsx")
-        df.to_excel(path, index=False)
+        df[export_cols].to_excel(path, index=False)
         files.append(path)
 
     if "pdf" in formats:
         path = os.path.join(out_dir, f"trade_area_snapshot_{stamp}.pdf")
-        _write_pdf_snapshot(df, no_website, by_category, spec, path)
+        _write_pdf_snapshot(df, no_website, by_category, spec, result, path)
         files.append(path)
 
     manifest = {
         "spec": spec,
+        "matched_categories": result.get("matched_categories"),
+        "center": result.get("center"),
         "competitor_count": len(df),
         "no_website_count": len(no_website),
         "no_website_pct": round(100 * len(no_website) / len(df), 1),
@@ -218,7 +257,8 @@ def fulfil(spec: dict, db_path: str, out_dir: str) -> list:
     return files
 
 
-def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category: pd.Series, spec: dict, path: str):
+def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category: pd.Series,
+                         spec: dict, result: dict, path: str):
     """One-page trade-area snapshot: this is the document an SBA loan
     applicant or their lender actually reads, not the raw CSV."""
     from reportlab.lib.pagesizes import letter
@@ -227,13 +267,19 @@ def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category:
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
 
+    center = result.get("center") or {"lat": spec.get("center_lat"), "lon": spec.get("center_lon")}
+    category_label = spec.get("address") and result.get("matched_categories") or spec["category"]
+
     styles = getSampleStyleSheet()
     doc = SimpleDocTemplate(path, pagesize=letter)
     story = [
-        Paragraph("Trade-Area Competitor Snapshot", styles["Title"]),
+        Paragraph("SBA Trade-Area Competitor Snapshot", styles["Title"]),
+        Spacer(1, 0.1 * inch),
+        Paragraph("Pre-screen reference only — not a substitute for a full feasibility study.",
+                  styles["Italic"]),
         Spacer(1, 0.15 * inch),
-        Paragraph(f"Center: ({spec['center_lat']}, {spec['center_lon']})  |  "
-                  f"Radius: {spec['radius_miles']} miles  |  Category: {spec['category']}",
+        Paragraph(f"Location: {spec.get('address', '')} ({center.get('lat'):.4f}, {center.get('lon'):.4f})  |  "
+                  f"Radius: {spec['radius_miles']} miles  |  Category: {category_label}",
                   styles["Normal"]),
         Spacer(1, 0.2 * inch),
         Paragraph(f"<b>{len(df)}</b> competitors found in trade area", styles["Heading2"]),
@@ -254,30 +300,27 @@ def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category:
     doc.build(story)
 
 
-def run_smoke_test(db_path: str):
-    """Call this yourself with a real parquet path — not auto-run on import
-    (same notebook-hijacking-sys.argv reason as service_lead_research_report.py)."""
-    spec = {
-        "center_lat": 39.9612,
-        "center_lon": -82.9988,
-        "radius_miles": 3,
-        "category": "dental_clinic",
+def run_smoke_test(api_base: str = DEFAULT_API_BASE):
+    """Call this yourself to sanity-check against the real live API —
+    not auto-run on import. Exercises BOTH call forms."""
+    spec_a = {
+        "address": "Columbus, OH",
+        "category": "dental clinic",
+        "radius_miles": 5,
         "country": "US",
         "output_formats": ["csv", "pdf"],
+        "api_base": api_base,
     }
-    preview = preview_trade_area(spec, db_path)
-    print("Preview:", preview)
+    print("Form (a) — address + loose category:")
+    preview = preview_trade_area(spec_a)
+    print("  Preview:", preview)
     if preview["competitor_count"] > 0:
-        files = fulfil(spec, db_path, "./test_trade_area")
-        print("Produced:", files)
+        files = fulfil(spec_a, "./test_trade_area_a")
+        print("  Produced:", files)
     else:
-        print("Zero competitors in this trade area for this spec — real finding, not an error.")
+        print("  Zero competitors — real finding, not an error.")
 
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] != "-f":
-        run_smoke_test(sys.argv[1])
-    else:
-        print("No real file path given on the command line — skipping the smoke test.")
-        print('In a notebook, call run_smoke_test("/path/to/business_database.parquet") yourself instead.')
+    run_smoke_test(sys.argv[1] if len(sys.argv) > 1 else DEFAULT_API_BASE)
