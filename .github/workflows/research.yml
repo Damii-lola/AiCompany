@@ -1,0 +1,57 @@
+name: Company Scrapper research request
+
+# Turns a plain-English request into a real SBA trade-area competitor
+# snapshot (CSV/XLSX/PDF) from the live database — this is the "addon to
+# the template AI" as a real GitHub Actions system, not a Kaggle GPU
+# notebook. See company_scrapper_ai.py's module docstring for why it
+# doesn't need a GPU or a model load at all: the request parsing and
+# category matching are both deterministic (regex + fuzzy match against
+# the real, live category list), so this job is just a few seconds of
+# plain Python hitting render-service's API, not an LLM inference run.
+#
+# Trigger from the Actions tab -> "Company Scrapper research request" ->
+# "Run workflow", fill in the request field. Or trigger programmatically
+# from elsewhere (a bot, a script) via the GitHub API's workflow_dispatch
+# endpoint with the same inputs.
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: >-
+          Plain-English research request, e.g. "find dental clinics with
+          no website within 3 miles of 123 Main St, Columbus, OH"
+        required: true
+        type: string
+      output_formats:
+        description: "Comma-separated output formats to produce"
+        required: false
+        default: "csv,pdf"
+        type: string
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas reportlab openpyxl
+
+      - name: Run research request
+        run: |
+          python company_scrapper_ai.py "${{ inputs.request }}" \
+            --formats "${{ inputs.output_formats }}" \
+            --out-dir ./out
+
+      - name: Upload deliverable
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: company-scrapper-research-${{ github.run_id }}
+          path: ./out
+          retention-days: 30
+          if-no-files-found: warn
