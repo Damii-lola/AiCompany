@@ -129,6 +129,43 @@ function parseRequest(nlRequest, realCategories) {
 }
 
 // ---------------------------------------------------------------------
+// Count / aggregate questions — "how many coffee shops are in the
+// database", "number of pharmacies", "count of dental clinics ur
+// database has". These have NO location at all and were previously
+// (wrongly) forced through the address/geocoding path, where a short,
+// locationless phrase like "in ur database" either failed to parse an
+// address and errored, or — worse — got misread as an address and sent
+// to the geocoder, producing a confusing "no match" error for a
+// question that was never about a place. Detected and answered
+// separately, with a real nationwide (no radius) count query.
+// ---------------------------------------------------------------------
+const _COUNT_RE = /\b(?:how many|number of|count of|total (?:number|count) of)\b/i;
+const _DB_FILLER_RE = /\s*(?:in|from|on|within)\s+(?:the|ur|your|our|my)?\s*(?:database|db|system|records?)\b\.?\s*$/i;
+// Generic helper/subject words that carry no category meaning of their
+// own ("are", "is", "businesses") — stripped wherever they appear, not
+// just at the edges, since "how many businesses are..." leaves "are"
+// stranded mid-phrase after the trailing db-filler is cut off the end.
+const _GENERIC_SUBJECT_WORDS = /\b(?:are|is|there|do|does|we|you|have|has|business(?:es)?|compan(?:y|ies)|listed|available)\b/gi;
+
+function isCountQuery(message) {
+  return _COUNT_RE.test(message);
+}
+
+/** Strips the count phrase itself ("how many", "number of"...), any
+ * trailing "...in the database" filler, leading request filler, and
+ * generic helper words with no category meaning — leaving (ideally)
+ * just a category phrase: "how many coffee shops are in the database"
+ * -> "coffee shops"; "how many businesses are in the database" -> ""
+ * (meaning "everything", not an unmatchable literal category). */
+function extractCountSubject(message) {
+  let text = message.replace(_COUNT_RE, "").trim();
+  text = text.replace(_DB_FILLER_RE, "").trim();
+  text = stripLeadingFiller(text);
+  text = text.replace(_GENERIC_SUBJECT_WORDS, " ");
+  return text.replace(/\s{2,}/g, " ").replace(/^[\s,.?]+|[\s,.?]+$/g, "");
+}
+
+// ---------------------------------------------------------------------
 // Delivery-mode detection — "listen for the output forms, from the user
 // request, it should determine if it want just basic in chat response,
 // or one of the output forms". Keyword scan over the ORIGINAL message
@@ -181,6 +218,21 @@ function buildChatReply({ address, matchedCategories, radiusMiles, summary, busi
     );
     lines.push("", "Closest matches:", ...top);
     if (businesses.length > 10) lines.push(`...and ${businesses.length - 10} more.`);
+  }
+  return lines.join("\n");
+}
+
+/** Natural-language reply for a count/aggregate question — built ONLY
+ * from real numbers already computed by the caller's nationwide count
+ * query, same "nothing fabricated" rule as buildChatReply. */
+function buildCountReply({ matchedCategories, total, noWebsite }) {
+  const catLabel = matchedCategories && matchedCategories.length
+    ? pluralizeLabel(matchedCategories.map((c) => c.replace(/_/g, " ")).join(", "), total)
+    : "businesses";
+  const verb = total === 1 ? "is" : "are";
+  const lines = [`There ${verb} ${total.toLocaleString()} ${catLabel} in the database.`];
+  if (total > 0) {
+    lines.push(`${noWebsite.toLocaleString()} of them have no website on file.`);
   }
   return lines.join("\n");
 }
@@ -255,6 +307,9 @@ module.exports = {
   buildChatReply,
   buildCsv,
   streamPdf,
+  isCountQuery,
+  extractCountSubject,
+  buildCountReply,
   // exported for testing
   stripWords,
   splitCategoryAndAddress,

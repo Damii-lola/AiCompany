@@ -87,6 +87,29 @@ function sameSet(a, b) {
   return true;
 }
 
+/** Counts word-identity overlap between two word sets, but — unlike a
+ * plain set intersection — also credits a simple one-letter-off typo
+ * word ("coffe" for "coffee") as a match, via per-word character
+ * similarity. Gated at >=0.8 and only for words of 4+ letters
+ * specifically so this never degrades into the whole-phrase
+ * cross-contamination bug this file already fixed once (a short,
+ * generic word like "in"/"of" fuzzy-matching something unrelated) —
+ * it only forgives a genuine near-miss spelling of a real word, never
+ * a loose phrase-level resemblance. */
+function fuzzyWordOverlap(termSet, catSet) {
+  let matched = 0;
+  const usedCat = new Set();
+  for (const tw of termSet) {
+    if (catSet.has(tw)) { matched++; continue; }
+    if (tw.length < 4) continue;
+    for (const cw of catSet) {
+      if (usedCat.has(cw) || cw.length < 4) continue;
+      if (similarity(tw, cw) >= 0.8) { matched++; usedCat.add(cw); break; }
+    }
+  }
+  return matched;
+}
+
 /** Word-identity-first scoring, NOT raw character similarity. Exact or
  * singularized-word-set matches score highest; character ratio
  * (similarity above) is kept only as a heavily-discounted fallback for
@@ -100,8 +123,7 @@ function categoryScore(term, normCat) {
   if (sameSet(termSet, catSet)) return 1;
   if (normCat.includes(term) || term.includes(normCat)) return 0.9;
   const union = new Set([...termSet, ...catSet]);
-  let overlap = 0;
-  for (const w of termSet) if (catSet.has(w)) overlap++;
+  const overlap = fuzzyWordOverlap(termSet, catSet);
   const jaccard = union.size ? overlap / union.size : 0;
   const charRatio = similarity(term, normCat);
   return Math.max(jaccard * 0.85, charRatio * 0.5);

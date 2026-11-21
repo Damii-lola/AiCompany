@@ -8,7 +8,10 @@ const { shards, queryEachShard, queryAll } = require("./lib/db");
 const { getRealCategories, closeMatches } = require("./lib/categories");
 const { geocodeAddress } = require("./lib/geocode");
 const { upsertBusinesses } = require("./lib/upsert");
-const { parseRequest, decideDeliveryMode, buildChatReply, buildCsv, streamPdf } = require("./lib/chat");
+const {
+  parseRequest, decideDeliveryMode, buildChatReply, buildCsv, streamPdf,
+  isCountQuery, extractCountSubject, buildCountReply,
+} = require("./lib/chat");
 
 // Shared by /api/trade-area and /api/research — both need the exact same
 // fan-out-across-shards-then-merge logic, so it lives in one place.
@@ -242,6 +245,47 @@ app.post("/api/chat", async (req, res) => {
     }
 
     const realCategories = await getRealCategories();
+
+    // Count/aggregate questions ("how many coffee shops are in the
+    // database") have no location at all — checked FIRST, before the
+    // address-requiring trade-area path, so a locationless question
+    // never gets misrouted into geocoding (which previously either
+    // errored on "no address" or, worse, got handed filler text like
+    // "in ur database" and produced a confusing geocoder error).
+    if (isCountQuery(message)) {
+      const subject = extractCountSubject(message);
+      let matchedCategories = [];
+      if (subject) {
+        matchedCategories = closeMatches(subject, realCategories);
+        if (matchedCategories.length === 0) {
+          return res.status(422).json({
+            error: `Could not match "${subject}" to any real category in the live database — `
+              + `try a different or more specific term.`,
+            real_category_sample: realCategories.slice(0, 20),
+          });
+        }
+      }
+      const where = matchedCategories.length ? "WHERE category = ANY($1)" : "";
+      const params = matchedCategories.length ? [matchedCategories] : [];
+      const perShard = await queryEachShard(
+        `SELECT count(*)::int AS total,
+                count(*) FILTER (WHERE website IS NULL OR website = '')::int AS no_website
+         FROM businesses_readable ${where}`,
+        params
+      );
+      let total = 0, noWebsite = 0;
+      for (const { rows: [row] } of perShard) {
+        total += row.total || 0;
+        noWebsite += row.no_website || 0;
+      }
+      return res.json({
+        mode: "chat",
+        reply: buildCountReply({ matchedCategories, total, noWebsite }),
+        matched_categories: matchedCategories,
+        total, no_website_count: noWebsite,
+      });
+    }
+
     const parsed = parseRequest(message, realCategories);
 
     if (!parsed.address) {
