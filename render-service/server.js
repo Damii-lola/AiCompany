@@ -8,6 +8,7 @@ const { shards, queryEachShard, queryAll } = require("./lib/db");
 const { getRealCategories, closeMatches } = require("./lib/categories");
 const { geocodeAddress } = require("./lib/geocode");
 const { upsertBusinesses } = require("./lib/upsert");
+const { parseRequest, decideDeliveryMode, buildChatReply, buildCsv, streamPdf } = require("./lib/chat");
 
 // Shared by /api/trade-area and /api/research — both need the exact same
 // fan-out-across-shards-then-merge logic, so it lives in one place.
@@ -212,6 +213,82 @@ app.post("/api/research", async (req, res) => {
     res.json({
       address, category,
       matched_categories: categories,
+      center: { lat, lon },
+      radius_miles: radiusMiles,
+      summary,
+      businesses,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------
+// Live chat — the real, always-on "addon to the template AI": a user
+// types a plain-English request, this parses it deterministically
+// (lib/chat.js — no model, no GPU, same reasoning as the old
+// company_scrapper_ai.py, just running in this process instead of a
+// GitHub Actions job), matches the category against the real live list,
+// geocodes, runs the exact same tradeAreaFanOut every other route uses,
+// then decides FROM THE MESSAGE ITSELF whether to answer inline or hand
+// back a file — docs/index.html's chat widget calls this directly and
+// gets an instant response either way, nothing to trigger manually.
+// ---------------------------------------------------------------------
+app.post("/api/chat", async (req, res) => {
+  try {
+    const { message } = req.body || {};
+    if (!message || typeof message !== "string" || !message.trim()) {
+      return res.status(400).json({ error: "Body must include a non-empty 'message'." });
+    }
+
+    const realCategories = await getRealCategories();
+    const parsed = parseRequest(message, realCategories);
+
+    if (!parsed.address) {
+      return res.status(422).json({
+        error: "Couldn't find a location in that request — include an address, city, or place name "
+          + "(e.g. \"coffee shops with no website within 2 miles of 123 Main St, Columbus, OH\").",
+      });
+    }
+
+    const matchedCategories = closeMatches(parsed.category, realCategories);
+    if (matchedCategories.length === 0) {
+      return res.status(422).json({
+        error: `Could not match "${parsed.category}" to any real category in the live database — `
+          + `try a different or more specific term rather than searching everything.`,
+        real_category_sample: realCategories.slice(0, 20),
+      });
+    }
+
+    const { lat, lon } = await geocodeAddress(parsed.address);
+    const radiusMiles = parsed.radius_miles || 3;
+    const { businesses, summary } = await tradeAreaFanOut(
+      lat, lon, radiusMiles, matchedCategories, parsed.no_website_only, parsed.country
+    );
+
+    const mode = decideDeliveryMode(message);
+    const payload = {
+      address: parsed.address, matchedCategories, radiusMiles, summary, businesses,
+      noWebsiteOnly: parsed.no_website_only,
+    };
+
+    if (mode === "csv" || mode === "xlsx") {
+      // xlsx would need a real spreadsheet-writing dependency (exceljs) —
+      // not added yet, so fall back to CSV (still a real, correct file,
+      // just not the exact extension asked for) rather than silently
+      // returning JSON when a file was explicitly requested.
+      res.setHeader("Content-Type", "text/csv");
+      res.setHeader("Content-Disposition", 'attachment; filename="trade_area_snapshot.csv"');
+      return res.send(buildCsv(businesses));
+    }
+    if (mode === "pdf") {
+      return streamPdf(res, payload);
+    }
+
+    res.json({
+      mode: "chat",
+      reply: buildChatReply(payload),
+      matched_categories: matchedCategories,
       center: { lat, lon },
       radius_miles: radiusMiles,
       summary,

@@ -31,9 +31,16 @@
   #error { color: #b00020; display: none; margin: 12px 0; }
   table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.85rem; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+  .chat-box { display: flex; gap: 8px; margin: 24px 0 8px; }
+  .chat-box input[type=text] { flex: 1; min-width: 0; }
+  #chat-reply { white-space: pre-wrap; background: #f6f6f6; border-radius: 10px; padding: 16px;
+                font-size: 0.9rem; display: none; margin-bottom: 8px; }
+  #chat-error { color: #b00020; display: none; margin: 8px 0; }
+  .hint { color: #777; font-size: 0.8rem; margin: 0 0 4px; }
   @media (prefers-color-scheme: dark) {
     .stat { border-color: #333; } th, td { border-color: #333; }
     #result { background: #1b1b1b; }
+    #chat-reply { background: #1b1b1b; }
   }
 </style>
 </head>
@@ -48,6 +55,18 @@
     <div class="stat"><span class="n">—</span><span class="l">last updated</span></div>
   </div>
 
+  <h2 style="margin-bottom:4px;">Ask it anything</h2>
+  <p class="hint">Type a plain-English request — "dental clinics with no website within 3 miles of
+    123 Main St, Columbus, OH". Ask for a "csv", "pdf", or "report" and you'll get a file instead
+    of a chat reply, automatically.</p>
+  <form id="chat-form" class="chat-box">
+    <input type="text" id="chat-input" placeholder="coffee shops near Denver, CO within 5 miles" required />
+    <button type="submit">Ask</button>
+  </form>
+  <div id="chat-error"></div>
+  <div id="chat-reply"></div>
+
+  <h2 style="margin-bottom:4px;">Structured search</h2>
   <form id="research-form">
     <div class="field">
       <label for="category">Business category</label>
@@ -149,6 +168,69 @@
       } finally {
         btn.disabled = false;
         btn.textContent = "Search";
+      }
+    });
+
+    // ---------------------------------------------------------------
+    // Live chat — calls /api/chat, which decides for itself (from the
+    // message text) whether to reply inline or hand back a file.
+    // A JSON content-type means a chat reply (or an error); anything
+    // else is a real file blob — trigger a browser download for it.
+    // ---------------------------------------------------------------
+    document.getElementById("chat-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const input = document.getElementById("chat-input");
+      const btn = e.target.querySelector("button");
+      const message = input.value.trim();
+      if (!message) return;
+
+      const replyEl = document.getElementById("chat-reply");
+      const errEl = document.getElementById("chat-error");
+      replyEl.style.display = "none";
+      errEl.style.display = "none";
+      btn.disabled = true;
+      btn.textContent = "Thinking...";
+
+      try {
+        const res = await fetch(`${API_BASE}/api/chat`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message }),
+        });
+
+        const contentType = res.headers.get("content-type") || "";
+        if (contentType.includes("application/json")) {
+          const data = await res.json();
+          if (!res.ok || data.error) {
+            errEl.textContent = data.error || `Request failed (HTTP ${res.status}).`;
+            errEl.style.display = "block";
+          } else {
+            replyEl.textContent = data.reply;
+            replyEl.style.display = "block";
+          }
+        } else {
+          // A real file (CSV/PDF) came back instead of JSON — download it.
+          const blob = await res.blob();
+          const disposition = res.headers.get("content-disposition") || "";
+          const m = /filename="?([^"]+)"?/.exec(disposition);
+          const filename = m ? m[1] : "trade_area_snapshot";
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          replyEl.textContent = `Downloaded ${filename}.`;
+          replyEl.style.display = "block";
+        }
+      } catch (err) {
+        errEl.textContent = `Request failed: ${err.message}`;
+        errEl.style.display = "block";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Ask";
       }
     });
 

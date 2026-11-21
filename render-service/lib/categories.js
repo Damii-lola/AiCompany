@@ -37,10 +37,15 @@ async function getRealCategories() {
   return cache.categories;
 }
 
-/** Lightweight close-match (token overlap + simple edit-distance ratio) —
- * no extra dependency needed, same role as Python's difflib.get_close_matches
- * in company_scrapper_ai.py: a cheap first pass that narrows the real list
- * down to a shortlist before the model picks from it. */
+/** Edit-distance ratio (Levenshtein-based) — kept only as a heavily-
+ * discounted fallback inside categoryScore below, for genuine near-miss
+ * spelling ("vetrinary" -> "veterinary"). NEVER used alone to decide a
+ * match: two unrelated category phrases of similar length can score
+ * deceptively high on character similarity alone just from sharing
+ * letters/spacing (this bit a previous version of this exact function —
+ * "coffee shops" scored close enough to "auto_repair_shop" to return
+ * both), which silently broadens a client's trade-area results to
+ * include a category they never asked about. */
 function similarity(a, b) {
   a = a.toLowerCase();
   b = b.toLowerCase();
@@ -60,17 +65,67 @@ function similarity(a, b) {
   return 1 - dist / Math.max(la, lb);
 }
 
-function closeMatches(term, categories, topK = 15) {
-  const t = term.trim().toLowerCase();
-  const tokenMatches = categories.filter(
-    (c) => c.toLowerCase().includes(t.replace(/\s+/g, "_")) || t.includes(c.toLowerCase().replace(/_/g, " "))
-  );
-  const scored = categories
-    .map((c) => ({ c, score: similarity(t, c.replace(/_/g, " ")) }))
-    .filter((x) => x.score >= 0.3)
-    .sort((a, b) => b.score - a.score)
-    .map((x) => x.c);
-  return [...new Set([...tokenMatches, ...scored])].slice(0, topK);
+/** Crude but effective for this domain: handles the two common English
+ * plural shapes separately rather than one blind rule — a trailing "ies"
+ * singularizes to "y" ("pharmacies" -> "pharmacy"), which a plain
+ * trailing-"s" strip would mangle into "pharmacie" and miss entirely;
+ * everything else over 3 letters just drops a trailing "s"
+ * ("shops" -> "shop"). */
+function singularizeWord(w) {
+  if (w.endsWith("ies") && w.length > 4) return w.slice(0, -3) + "y";
+  if (w.endsWith("s") && w.length > 3) return w.slice(0, -1);
+  return w;
 }
 
-module.exports = { getRealCategories, closeMatches };
+function singularizeWords(s) {
+  return new Set(s.split(/\s+/).filter(Boolean).map(singularizeWord));
+}
+
+function sameSet(a, b) {
+  if (a.size !== b.size) return false;
+  for (const x of a) if (!b.has(x)) return false;
+  return true;
+}
+
+/** Word-identity-first scoring, NOT raw character similarity. Exact or
+ * singularized-word-set matches score highest; character ratio
+ * (similarity above) is kept only as a heavily-discounted fallback for
+ * genuine near-miss spelling, never enough on its own to beat a real
+ * word-level mismatch. Same approach as (and must stay in sync with)
+ * company_scrapper_ai.py's _category_score. */
+function categoryScore(term, normCat) {
+  if (term === normCat) return 1;
+  const termSet = singularizeWords(term);
+  const catSet = singularizeWords(normCat);
+  if (sameSet(termSet, catSet)) return 1;
+  if (normCat.includes(term) || term.includes(normCat)) return 0.9;
+  const union = new Set([...termSet, ...catSet]);
+  let overlap = 0;
+  for (const w of termSet) if (catSet.has(w)) overlap++;
+  const jaccard = union.size ? overlap / union.size : 0;
+  const charRatio = similarity(term, normCat);
+  return Math.max(jaccard * 0.85, charRatio * 0.5);
+}
+
+/** Maps what a user actually says ("dentist", "coffee shop") to the REAL
+ * category strings in the database. Scores every real category against
+ * the space-normalized form (Overture's real taxonomy values are
+ * typically snake_case, "dental_clinic", "coffee_shop", while a user
+ * types them with spaces) via categoryScore, then — critically — only
+ * returns matches within a real margin of the single best score, so a
+ * weak secondary match never gets smuggled into a list that's OR'd
+ * together in the live query (which previously silently broadened
+ * results to include a category nobody asked for). */
+function closeMatches(term, categories, topK = 3, minScore = 0.45) {
+  const t = term.trim().toLowerCase();
+  if (!t) return [];
+  const scored = categories
+    .map((c) => ({ c, score: categoryScore(t, c.replace(/_/g, " ").toLowerCase()) }))
+    .filter((x) => x.score >= minScore)
+    .sort((a, b) => b.score - a.score);
+  if (scored.length === 0) return [];
+  const best = scored[0].score;
+  return scored.filter((x) => x.score >= best - 0.2).slice(0, topK).map((x) => x.c);
+}
+
+module.exports = { getRealCategories, closeMatches, categoryScore, singularizeWords };

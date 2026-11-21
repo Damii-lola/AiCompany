@@ -1,6 +1,25 @@
 """
 Researchers / Company Scrapper — plain-English SBA trade-area research
+(STANDALONE CLI / OFFLINE TOOL — superseded for LIVE use)
 ==============================================================================
+SUPERSEDED for live requests (Nov 2026): the user's call — "The ai chat
+system shouldnt be on github actions but on the main github pagess" —
+moved the live request path off this script (and off
+.github/workflows/research.yml, now deleted) and into
+render-service/lib/chat.js, running inside the always-on Node backend so
+docs/index.html's chat widget gets an instant HTTP response instead of a
+manual workflow_dispatch form + artifact download. lib/chat.js is a
+straight JS port of this file's parsing/category-matching logic (keep
+both in sync if either changes) plus delivery-mode auto-detection
+(inline chat reply vs. CSV/PDF file, decided from the request wording
+itself) and CSV/PDF generation (pdfkit, no Python needed in that path).
+
+This file is kept as a standalone local/offline CLI — still fully
+functional, useful for scripted or batch runs outside the live chat path
+(it still calls service_sba_trade_area_snapshot.py directly for the
+actual fetch/filter/file-writing work) — it's just no longer part of
+how a live user request gets answered.
+
 First AI in the "Researchers" category (Company Scrapper, Basic Researcher,
 Advance Researcher, Organizer). Job: a user types a plain-English research
 request, this turns it into a real structured query against the live
