@@ -5,82 +5,175 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Company Scrapper — Live</title>
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #0b0c0f;
+    --panel: #121318;
+    --panel-2: #181a21;
+    --border: #262833;
+    --text: #e8e9ed;
+    --text-dim: #8b8d98;
+    --text-dimmer: #5c5e6b;
+    --accent: #6c6cf5;
+    --accent-dim: #3a3a8c;
+    --accent-bg: rgba(108, 108, 245, 0.12);
+    --danger: #ff6b6b;
+    --danger-bg: #3a1d1f;
+    --radius: 10px;
+  }
   * { box-sizing: border-box; }
-  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; max-width: 1100px;
-         margin: 40px auto; padding: 0 16px; line-height: 1.5; }
-  h1 { font-size: 1.6rem; margin-bottom: 4px; }
-  .sub { color: #777; margin-top: 0; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 12px; margin: 24px 0; }
-  .stat { border: 1px solid #ddd; border-radius: 10px; padding: 16px; text-align: center; }
-  .stat .n { font-size: 1.8rem; font-weight: 700; display: block; }
-  .stat .l { font-size: 0.85rem; color: #777; }
-  form { display: flex; gap: 8px; margin: 24px 0; flex-wrap: wrap; align-items: center; }
-  form .field { display: flex; flex-direction: column; gap: 4px; }
-  form label { font-size: 0.8rem; color: #777; }
-  input[type=text], input[type=number] { padding: 10px 12px; border-radius: 8px;
-                      border: 1px solid #ccc; font-size: 1rem; background: transparent; color: inherit; }
-  input[type=text] { min-width: 220px; }
-  input[type=number] { width: 90px; }
-  .checkbox-field { flex-direction: row; align-items: center; gap: 6px; margin-top: 18px; }
-  button { padding: 10px 18px; border-radius: 8px; border: none; background: #222;
-           color: #fff; font-size: 1rem; cursor: pointer; }
-  button:disabled { opacity: 0.5; cursor: default; }
-  #result { white-space: pre-wrap; background: #f6f6f6; border-radius: 10px; padding: 16px;
-             font-size: 0.9rem; display: none; }
-  #error { color: #b00020; display: none; margin: 12px 0; }
-  table { width: 100%; border-collapse: collapse; margin-top: 12px; font-size: 0.85rem; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
-  .hint { color: #777; font-size: 0.8rem; margin: 0 0 4px; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    margin: 0; background: var(--bg); color: var(--text);
+    line-height: 1.5; font-size: 14px;
+  }
+  a { color: var(--accent); }
+  button { font-family: inherit; cursor: pointer; }
+  input[type=text], input[type=search] {
+    font-family: inherit; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; font-size: 0.85rem;
+  }
+  input[type=text]:focus, input[type=search]:focus { outline: none; border-color: var(--accent); }
+  input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
 
-  /* --- Chat --- */
-  .chat-app { display: flex; gap: 0; border: 1px solid #ddd; border-radius: 12px;
-              overflow: hidden; height: 560px; margin: 16px 0 32px; }
-  .chat-sidebar { width: 220px; flex-shrink: 0; background: #f6f6f6; border-right: 1px solid #ddd;
+  .page-head { padding: 20px 24px 0; }
+  .page-head h1 { font-size: 1.3rem; margin: 0 0 2px; }
+  .page-head .sub { color: var(--text-dim); margin: 0; font-size: 0.85rem; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 10px; margin: 16px 24px; }
+  .stat { border: 1px solid var(--border); background: var(--panel); border-radius: var(--radius);
+          padding: 12px 14px; }
+  .stat .n { font-size: 1.4rem; font-weight: 700; display: block; }
+  .stat .l { font-size: 0.75rem; color: var(--text-dim); }
+
+  /* --- Tabs --- */
+  .tabs { display: flex; gap: 4px; margin: 4px 24px 0; border-bottom: 1px solid var(--border); }
+  .tab-btn { background: none; border: none; color: var(--text-dim); font-size: 0.9rem;
+             padding: 10px 14px; border-bottom: 2px solid transparent; }
+  .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* ===================================================================
+     Find Companies — Apollo-style filter sidebar + paginated result
+     table. This is the PRIMARY way to find companies now: every filter
+     value comes from GET /api/filters (real, live database values —
+     never a hardcoded guess), and the result table is GET /api/companies,
+     a real paginated+filtered query, 30 real rows per page.
+     =================================================================== */
+  .finder { display: flex; align-items: flex-start; gap: 0; margin: 0 24px 24px;
+            border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+            background: var(--panel); min-height: 70vh; }
+
+  .finder-sidebar { width: 260px; flex-shrink: 0; border-right: 1px solid var(--border);
+                     max-height: 78vh; overflow-y: auto; }
+  .finder-sidebar-head { display: flex; align-items: center; justify-content: space-between;
+                          padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .finder-sidebar-head strong { font-size: 0.85rem; }
+  .clear-link { background: none; border: none; color: var(--accent); font-size: 0.78rem; padding: 0; }
+  .clear-link:disabled { color: var(--text-dimmer); cursor: default; }
+
+  .filter-group { border-bottom: 1px solid var(--border); }
+  .filter-group-head { display: flex; align-items: center; justify-content: space-between;
+                        padding: 11px 14px; background: none; border: none; width: 100%;
+                        color: var(--text); font-size: 0.82rem; font-weight: 600; text-align: left; }
+  .filter-group-head .count-pill { font-weight: 400; color: var(--text-dim); font-size: 0.72rem;
+                        background: var(--panel-2); border-radius: 20px; padding: 1px 7px; margin-left: 6px; }
+  .filter-group-head .chev { transition: transform 0.15s; color: var(--text-dim); font-size: 0.7rem; }
+  .filter-group.collapsed .chev { transform: rotate(-90deg); }
+  .filter-group-body { padding: 0 14px 12px; }
+  .filter-group.collapsed .filter-group-body { display: none; }
+  .filter-search { width: 100%; margin-bottom: 8px; }
+  .filter-list { max-height: 190px; overflow-y: auto; display: flex; flex-direction: column; gap: 1px; }
+  .filter-option { display: flex; align-items: center; gap: 8px; padding: 5px 2px; border-radius: 5px;
+                    font-size: 0.82rem; cursor: pointer; }
+  .filter-option:hover { background: var(--panel-2); }
+  .filter-option label { cursor: pointer; flex: 1; overflow: hidden; text-overflow: ellipsis;
+                          white-space: nowrap; }
+  .filter-empty-note { color: var(--text-dimmer); font-size: 0.78rem; padding: 4px 2px; }
+
+  .finder-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .finder-top { display: flex; align-items: center; justify-content: space-between;
+                padding: 12px 18px; border-bottom: 1px solid var(--border); }
+  .finder-total { font-size: 0.9rem; }
+  .finder-total strong { font-weight: 700; }
+  .finder-top .active-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-flex; align-items: center; gap: 5px; background: var(--accent-bg);
+          color: var(--accent); border-radius: 20px; padding: 3px 9px 3px 10px; font-size: 0.75rem; }
+  .chip .x { cursor: pointer; opacity: 0.8; }
+  .chip .x:hover { opacity: 1; }
+
+  .table-wrap { flex: 1; overflow: auto; }
+  table.companies { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  table.companies th { position: sticky; top: 0; background: var(--panel); text-align: left;
+                        padding: 9px 14px; color: var(--text-dim); font-weight: 600;
+                        font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em;
+                        border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.companies td { padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.companies tr:hover td { background: var(--panel-2); }
+  .co-name { font-weight: 600; }
+  .co-sub { color: var(--text-dim); font-size: 0.76rem; }
+  .status-pill { display: inline-block; padding: 1px 8px; border-radius: 20px; font-size: 0.72rem;
+                 background: var(--panel-2); color: var(--text-dim); }
+  .status-pill.open { color: #4ade80; }
+  .status-pill.closed { color: var(--danger); }
+  .no-site { color: var(--text-dimmer); font-style: italic; }
+  .finder-empty, .finder-loading { margin: auto; padding: 60px 20px; text-align: center;
+                      color: var(--text-dim); font-size: 0.9rem; }
+
+  .finder-pagination { display: flex; align-items: center; justify-content: space-between;
+                        padding: 10px 18px; border-top: 1px solid var(--border); font-size: 0.82rem; }
+  .finder-pagination button { background: var(--panel-2); border: 1px solid var(--border);
+                        color: var(--text); border-radius: 7px; padding: 6px 12px; font-size: 0.8rem; }
+  .finder-pagination button:disabled { opacity: 0.4; cursor: default; }
+  .finder-pagination button:not(:disabled):hover { border-color: var(--accent); }
+
+  @media (max-width: 760px) {
+    .finder { flex-direction: column; }
+    .finder-sidebar { width: 100%; max-height: 240px; border-right: none; border-bottom: 1px solid var(--border); }
+  }
+
+  /* --- Chat (secondary tab) --- */
+  .chat-app { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 12px;
+              overflow: hidden; height: 560px; margin: 0 24px 24px; background: var(--panel); }
+  .chat-sidebar { width: 220px; flex-shrink: 0; background: var(--panel-2); border-right: 1px solid var(--border);
                   display: flex; flex-direction: column; }
   .chat-sidebar .new-chat-btn { margin: 10px; padding: 9px 12px; border-radius: 8px; border: none;
-                  background: #222; color: #fff; font-size: 0.85rem; cursor: pointer; text-align: left; }
+                  background: var(--accent); color: #fff; font-size: 0.85rem; text-align: left; }
   .chat-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
   .chat-list-item { padding: 9px 10px; border-radius: 8px; font-size: 0.85rem; cursor: pointer;
                      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
                      display: flex; align-items: center; gap: 6px; }
-  .chat-list-item:hover { background: #ebebeb; }
-  .chat-list-item.active { background: #e2e2e2; font-weight: 600; }
-  .chat-list-item .del { margin-left: auto; opacity: 0; font-size: 0.75rem; color: #999; }
+  .chat-list-item:hover { background: #20222b; }
+  .chat-list-item.active { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
+  .chat-list-item .del { margin-left: auto; opacity: 0; font-size: 0.75rem; color: var(--text-dim); }
   .chat-list-item:hover .del { opacity: 1; }
   .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   .chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-  .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 0.9rem; white-space: pre-wrap; }
-  .msg.user { align-self: flex-end; background: #222; color: #fff; border-bottom-right-radius: 3px; }
-  .msg.assistant { align-self: flex-start; background: #f0f0f0; border-bottom-left-radius: 3px; }
-  .msg.assistant.is-error { background: #fdecea; color: #b00020; }
-  .msg .meta { display: block; font-size: 0.7rem; opacity: 0.6; margin-top: 4px; }
-  .chat-empty { margin: auto; text-align: center; color: #999; font-size: 0.9rem; max-width: 320px; }
-  .chat-input-row { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #ddd; }
+  .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 0.88rem; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
+  .msg.assistant { align-self: flex-start; background: var(--panel-2); border-bottom-left-radius: 3px; }
+  .msg.assistant.is-error { background: var(--danger-bg); color: var(--danger); }
+  .chat-empty { margin: auto; text-align: center; color: var(--text-dim); font-size: 0.9rem; max-width: 320px; }
+  .chat-input-row { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
   .chat-input-row input[type=text] { flex: 1; min-width: 0; }
+  .chat-input-row button { padding: 10px 16px; border-radius: 8px; border: none;
+                            background: var(--accent); color: #fff; font-size: 0.9rem; }
+  .chat-input-row button:disabled { opacity: 0.5; }
   @media (max-width: 640px) {
     .chat-app { flex-direction: column; height: 640px; }
-    .chat-sidebar { width: 100%; height: 130px; border-right: none; border-bottom: 1px solid #ddd; }
-  }
-
-  @media (prefers-color-scheme: dark) {
-    .stat { border-color: #333; } th, td { border-color: #333; }
-    #result { background: #1b1b1b; }
-    .chat-app { border-color: #333; }
-    .chat-sidebar { background: #161616; border-color: #333; }
-    .chat-list-item:hover { background: #222; }
-    .chat-list-item.active { background: #262626; }
-    .msg.assistant { background: #262626; }
-    .msg.assistant.is-error { background: #3a1d1f; color: #ff6b6b; }
-    .chat-input-row { border-color: #333; }
-    input[type=text], input[type=number] { border-color: #444; }
+    .chat-sidebar { width: 100%; height: 130px; border-right: none; border-bottom: 1px solid var(--border); }
   }
 </style>
 </head>
 <body>
-  <h1>Company Scrapper</h1>
-  <p class="sub">Live view of the Researchers category's always-on business discovery AI.</p>
+  <div class="page-head">
+    <h1>Company Scrapper</h1>
+    <p class="sub">Live view of the Researchers category's always-on business discovery AI.</p>
+  </div>
 
   <div class="stats" id="stats">
     <div class="stat"><span class="n">—</span><span class="l">businesses tracked</span></div>
@@ -89,52 +182,73 @@
     <div class="stat"><span class="n">—</span><span class="l">last updated</span></div>
   </div>
 
-  <h2 style="margin-bottom:4px;">Ask it anything</h2>
-  <p class="hint">Type a plain-English request — "dental clinics with no website within 3 miles of
-    123 Main St, Columbus, OH". Ask "how many coffee shops are there", or follow up on an earlier
-    answer ("now show no-website only", "give me that as a csv"). Each chat remembers its own
-    conversation; start a new chat for a fresh one.</p>
+  <div class="tabs">
+    <button class="tab-btn active" data-tab="finder">Find Companies</button>
+    <button class="tab-btn" data-tab="chat">Chat</button>
+  </div>
 
-  <div class="chat-app">
-    <div class="chat-sidebar">
-      <button class="new-chat-btn" id="new-chat-btn">+ New chat</button>
-      <div class="chat-list" id="chat-list"></div>
-    </div>
-    <div class="chat-main">
-      <div class="chat-messages" id="chat-messages"></div>
-      <form class="chat-input-row" id="chat-form">
-        <input type="text" id="chat-input" placeholder="coffee shops near Denver, CO within 5 miles" autocomplete="off" />
-        <button type="submit" id="chat-send-btn">Send</button>
-      </form>
+  <!-- ================= Find Companies ================= -->
+  <div class="tab-panel active" id="tab-finder">
+    <div class="finder">
+      <div class="finder-sidebar" id="finder-sidebar">
+        <div class="finder-sidebar-head">
+          <strong>Filters</strong>
+          <button class="clear-link" id="clear-filters-btn" disabled>Clear all</button>
+        </div>
+        <div id="filter-groups-dynamic"><div class="finder-loading">Loading filters…</div></div>
+        <div id="filter-groups-static"></div>
+      </div>
+      <div class="finder-main">
+        <div class="finder-top">
+          <div class="finder-total" id="finder-total">Loading…</div>
+          <div class="active-chips" id="active-chips"></div>
+        </div>
+        <div class="table-wrap" id="table-wrap">
+          <div class="finder-loading">Loading companies…</div>
+        </div>
+        <div class="finder-pagination" id="finder-pagination" style="display:none;">
+          <button id="pg-prev">‹ Prev</button>
+          <span id="pg-label"></span>
+          <button id="pg-next">Next ›</button>
+        </div>
+      </div>
     </div>
   </div>
 
-  <h2 style="margin-bottom:4px;">Structured search</h2>
-  <form id="research-form">
-    <div class="field">
-      <label for="category">Business category</label>
-      <input type="text" id="category" placeholder="dental clinic" required />
+  <!-- ================= Chat ================= -->
+  <div class="tab-panel" id="tab-chat">
+    <p class="sub" style="margin:0 24px 10px;">Ask it anything — a plain-English request, a count
+      question, or a follow-up on an earlier answer. Each chat remembers its own conversation.</p>
+    <div class="chat-app">
+      <div class="chat-sidebar">
+        <button class="new-chat-btn" id="new-chat-btn">+ New chat</button>
+        <div class="chat-list" id="chat-list"></div>
+      </div>
+      <div class="chat-main">
+        <div class="chat-messages" id="chat-messages"></div>
+        <form class="chat-input-row" id="chat-form">
+          <input type="text" id="chat-input" placeholder="coffee shops near Denver, CO within 5 miles" autocomplete="off" />
+          <button type="submit" id="chat-send-btn">Send</button>
+        </form>
+      </div>
     </div>
-    <div class="field">
-      <label for="address">Address or place</label>
-      <input type="text" id="address" placeholder="123 Main St, Columbus, OH" required />
-    </div>
-    <div class="field">
-      <label for="radius">Radius (mi)</label>
-      <input type="number" id="radius" value="3" min="0.1" step="0.5" />
-    </div>
-    <div class="field checkbox-field">
-      <input type="checkbox" id="no-website" />
-      <label for="no-website">No website only</label>
-    </div>
-    <button type="submit">Search</button>
-  </form>
-  <div id="error"></div>
-  <div id="result"></div>
+  </div>
 
   <script>
     // Update this if the Render service's URL ever changes.
     const API_BASE = "https://aicompany-tmg7.onrender.com";
+
+    // =====================================================================
+    // Tabs
+    // =====================================================================
+    document.querySelectorAll(".tab-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
+        document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
+        btn.classList.add("active");
+        document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
+      });
+    });
 
     async function loadStats() {
       try {
@@ -147,84 +261,332 @@
         cards[2].querySelector(".n").textContent = (s.distinct_categories ?? 0).toLocaleString();
         cards[3].querySelector(".n").textContent = s.last_updated
           ? new Date(s.last_updated).toLocaleString() : "—";
-      } catch (e) {
-        document.getElementById("error").textContent =
-          `Couldn't reach the live service right now (${e.message}). It may still be waking up — try again in a few seconds.`;
-        document.getElementById("error").style.display = "block";
+      } catch (e) { /* stats are a nice-to-have header — a failure here shouldn't block the rest of the page */ }
+    }
+
+    // =====================================================================
+    // Find Companies — Apollo-style filter sidebar + paginated table.
+    // Every filter VALUE shown (categories/countries/regions/statuses)
+    // comes straight from GET /api/filters — real distinct values live in
+    // the database right now, never a hand-maintained guess list. Picking
+    // filters re-queries GET /api/companies, a real filtered+paginated
+    // search (30 real rows/page) — nothing here is estimated or faked.
+    // =====================================================================
+    const finderState = {
+      options: null,                 // { categories, countries, regions: {country: [..]}, statuses }
+      selected: { categories: new Set(), countries: new Set(), regions: new Set(), statuses: new Set() },
+      noWebsiteOnly: false,
+      city: "",
+      page: 1,
+      searchTerms: {},                // per-group live filter-the-checkbox-list text
+      collapsed: {},                  // per-group collapsed state
+    };
+
+    const FILTER_GROUPS = [
+      { key: "categories", label: "Category", searchable: true },
+      { key: "countries", label: "Country", searchable: false },
+      { key: "regions", label: "State / Region", searchable: true },
+      { key: "statuses", label: "Status", searchable: false },
+    ];
+
+    function optionsFor(groupKey) {
+      if (!finderState.options) return [];
+      if (groupKey === "regions") {
+        // Regions are grouped by country server-side (a region code only
+        // means something in context); flattened here into one pickable
+        // list since this platform only has US + its own territories today.
+        const out = [];
+        for (const country of Object.keys(finderState.options.regions || {})) {
+          for (const r of finderState.options.regions[country]) out.push(r);
+        }
+        return [...new Set(out)].sort();
+      }
+      return finderState.options[groupKey] || [];
+    }
+
+    function renderFilterGroups() {
+      const container = document.getElementById("filter-groups-dynamic");
+      container.innerHTML = "";
+
+      for (const group of FILTER_GROUPS) {
+        const all = optionsFor(group.key);
+        const wrap = document.createElement("div");
+        wrap.className = "filter-group" + (finderState.collapsed[group.key] ? " collapsed" : "");
+
+        const selectedCount = finderState.selected[group.key].size;
+        const head = document.createElement("button");
+        head.className = "filter-group-head";
+        head.innerHTML = `<span>${group.label}${selectedCount ? `<span class="count-pill">${selectedCount}</span>` : ""}</span><span class="chev">▾</span>`;
+        head.addEventListener("click", () => {
+          finderState.collapsed[group.key] = !finderState.collapsed[group.key];
+          renderFilterGroups();
+        });
+        wrap.appendChild(head);
+
+        const body = document.createElement("div");
+        body.className = "filter-group-body";
+
+        if (all.length === 0) {
+          body.innerHTML = `<div class="filter-empty-note">No real "${group.label.toLowerCase()}" values in the database yet.</div>`;
+        } else {
+          if (group.searchable && all.length > 8) {
+            const search = document.createElement("input");
+            search.type = "search";
+            search.className = "filter-search";
+            search.placeholder = `Search ${group.label.toLowerCase()}…`;
+            search.value = finderState.searchTerms[group.key] || "";
+            search.addEventListener("input", () => {
+              finderState.searchTerms[group.key] = search.value;
+              renderOptionList(group.key, listEl);
+            });
+            body.appendChild(search);
+          }
+          const listEl = document.createElement("div");
+          listEl.className = "filter-list";
+          body.appendChild(listEl);
+          renderOptionList(group.key, listEl);
+        }
+
+        wrap.appendChild(body);
+        container.appendChild(wrap);
+      }
+
+      updateClearButton();
+    }
+
+    function renderOptionList(groupKey, listEl) {
+      const term = (finderState.searchTerms[groupKey] || "").toLowerCase();
+      const all = optionsFor(groupKey).filter((v) => !term || v.toLowerCase().includes(term));
+      listEl.innerHTML = "";
+      for (const value of all) {
+        const id = `f-${groupKey}-${value}`;
+        const row = document.createElement("div");
+        row.className = "filter-option";
+        const checked = finderState.selected[groupKey].has(value);
+        row.innerHTML = `<input type="checkbox" id="${id}" ${checked ? "checked" : ""}/><label for="${id}">${escapeHtml(value.replace(/_/g, " "))}</label>`;
+        row.querySelector("input").addEventListener("change", (e) => {
+          if (e.target.checked) finderState.selected[groupKey].add(value);
+          else finderState.selected[groupKey].delete(value);
+          finderState.page = 1;
+          renderFilterGroups();
+          renderActiveChips();
+          fetchCompanies();
+        });
+        listEl.appendChild(row);
+      }
+      if (all.length === 0) {
+        listEl.innerHTML = `<div class="filter-empty-note">No matches.</div>`;
       }
     }
 
-    function renderResult(data) {
-      const errEl = document.getElementById("error");
-      const resEl = document.getElementById("result");
-      errEl.style.display = "none";
-      resEl.style.display = "block";
+    function updateClearButton() {
+      const anyActive = Object.values(finderState.selected).some((s) => s.size > 0)
+        || finderState.noWebsiteOnly || finderState.city;
+      document.getElementById("clear-filters-btn").disabled = !anyActive;
+    }
 
-      if (data.error) {
-        resEl.style.display = "none";
-        errEl.textContent = data.error;
-        errEl.style.display = "block";
+    function renderActiveChips() {
+      const box = document.getElementById("active-chips");
+      box.innerHTML = "";
+      const addChip = (text, onRemove) => {
+        const chip = document.createElement("span");
+        chip.className = "chip";
+        chip.innerHTML = `${escapeHtml(text)}<span class="x">✕</span>`;
+        chip.querySelector(".x").addEventListener("click", onRemove);
+        box.appendChild(chip);
+      };
+      for (const group of FILTER_GROUPS) {
+        for (const value of finderState.selected[group.key]) {
+          addChip(value.replace(/_/g, " "), () => {
+            finderState.selected[group.key].delete(value);
+            finderState.page = 1;
+            renderFilterGroups(); renderActiveChips(); fetchCompanies();
+          });
+        }
+      }
+      if (finderState.noWebsiteOnly) {
+        addChip("No website", () => {
+          finderState.noWebsiteOnly = false;
+          document.getElementById("no-website-toggle") && (document.getElementById("no-website-toggle").checked = false);
+          finderState.page = 1;
+          renderActiveChips(); fetchCompanies();
+        });
+      }
+      if (finderState.city) {
+        addChip(`City: ${finderState.city}`, () => {
+          finderState.city = "";
+          const input = document.getElementById("city-filter-input");
+          if (input) input.value = "";
+          finderState.page = 1;
+          renderActiveChips(); fetchCompanies();
+        });
+      }
+    }
+
+    document.getElementById("clear-filters-btn").addEventListener("click", () => {
+      for (const group of FILTER_GROUPS) finderState.selected[group.key].clear();
+      finderState.noWebsiteOnly = false;
+      finderState.city = "";
+      finderState.page = 1;
+      const websiteToggle = document.getElementById("no-website-toggle");
+      if (websiteToggle) websiteToggle.checked = false;
+      const cityInput = document.getElementById("city-filter-input");
+      if (cityInput) cityInput.value = "";
+      renderFilterGroups();
+      renderActiveChips();
+      fetchCompanies();
+    });
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    }
+
+    function statusPillHtml(status) {
+      if (!status) return "";
+      const cls = /open/i.test(status) ? "open" : /closed/i.test(status) ? "closed" : "";
+      return `<span class="status-pill ${cls}">${escapeHtml(status)}</span>`;
+    }
+
+    function renderCompanies(data) {
+      const wrap = document.getElementById("table-wrap");
+      const totalEl = document.getElementById("finder-total");
+      const pagEl = document.getElementById("finder-pagination");
+
+      totalEl.innerHTML = `<strong>${data.total.toLocaleString()}</strong> compan${data.total === 1 ? "y" : "ies"} match`;
+
+      if (!data.companies.length) {
+        wrap.innerHTML = `<div class="finder-empty">No companies match these filters yet. Try removing one.</div>`;
+        pagEl.style.display = "none";
         return;
       }
 
-      const s = data.summary || {};
-      let html = `<strong>${s.competitor_count ?? data.businesses.length} competitors found</strong>`;
-      html += ` (${s.no_website_count ?? "?"} with no website)`;
-      if (s.nearest_miles != null) html += ` — nearest ${Number(s.nearest_miles).toFixed(2)} mi away`;
-      html += `<br>Matched categories: ${data.matched_categories.join(", ")}<br><br>`;
-
-      if (data.businesses && data.businesses.length) {
-        html += "<table><tr><th>Name</th><th>Category</th><th>City</th><th>Website</th></tr>";
-        for (const b of data.businesses.slice(0, 50)) {
-          html += `<tr><td>${b.name || ""}</td><td>${b.category || ""}</td><td>${b.city || ""}</td>`
-                + `<td>${b.website || "—"}</td></tr>`;
-        }
-        html += "</table>";
-        if (data.businesses.length > 50) html += `<p>...and ${data.businesses.length - 50} more.</p>`;
+      let html = `<table class="companies"><thead><tr>
+        <th>Name</th><th>Category</th><th>Location</th><th>Website</th><th>Phone</th><th>Status</th>
+      </tr></thead><tbody>`;
+      for (const c of data.companies) {
+        const loc = [c.city, c.region].filter(Boolean).join(", ") || "—";
+        const website = c.website
+          ? `<a href="${escapeHtml(c.website)}" target="_blank" rel="noopener">${escapeHtml(c.website.replace(/^https?:\/\//, ""))}</a>`
+          : `<span class="no-site">no website</span>`;
+        html += `<tr>
+          <td class="co-name">${escapeHtml(c.name || "(unnamed)")}${c.address ? `<div class="co-sub">${escapeHtml(c.address)}</div>` : ""}</td>
+          <td>${escapeHtml((c.category || "").replace(/_/g, " "))}</td>
+          <td>${escapeHtml(loc)}</td>
+          <td>${website}</td>
+          <td>${c.phone ? escapeHtml(c.phone) : "—"}</td>
+          <td>${statusPillHtml(c.operating_status)}</td>
+        </tr>`;
       }
-      resEl.innerHTML = html;
+      html += "</tbody></table>";
+      wrap.innerHTML = html;
+
+      const start = (data.page - 1) * data.pageSize + 1;
+      const end = Math.min(data.page * data.pageSize, data.total);
+      document.getElementById("pg-label").textContent = `${start.toLocaleString()}–${end.toLocaleString()} of ${data.total.toLocaleString()}`;
+      document.getElementById("pg-prev").disabled = data.page <= 1;
+      document.getElementById("pg-next").disabled = end >= data.total;
+      pagEl.style.display = "flex";
     }
 
-    document.getElementById("research-form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const btn = e.target.querySelector("button");
-      const category = document.getElementById("category").value.trim();
-      const address = document.getElementById("address").value.trim();
-      const radius_miles = parseFloat(document.getElementById("radius").value) || 3;
-      const no_website_only = document.getElementById("no-website").checked;
-      if (!category || !address) return;
-      btn.disabled = true;
-      btn.textContent = "Searching...";
-      document.getElementById("error").style.display = "none";
-      document.getElementById("result").style.display = "none";
-      try {
-        const res = await fetch(`${API_BASE}/api/research`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ category, address, radius_miles, no_website_only }),
-        });
-        const data = await res.json();
-        renderResult(data);
-      } catch (err) {
-        document.getElementById("error").textContent = `Request failed: ${err.message}`;
-        document.getElementById("error").style.display = "block";
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Search";
+    let fetchToken = 0;
+    async function fetchCompanies() {
+      const token = ++fetchToken;
+      const wrap = document.getElementById("table-wrap");
+      wrap.innerHTML = `<div class="finder-loading">Loading companies…</div>`;
+      updateClearButton();
+
+      const qp = new URLSearchParams();
+      for (const group of FILTER_GROUPS) {
+        if (finderState.selected[group.key].size) qp.set(group.key, [...finderState.selected[group.key]].join(","));
       }
+      if (finderState.noWebsiteOnly) qp.set("no_website_only", "true");
+      if (finderState.city) qp.set("city", finderState.city);
+      qp.set("page", String(finderState.page));
+
+      try {
+        const res = await fetch(`${API_BASE}/api/companies?${qp.toString()}`);
+        const data = await res.json();
+        if (token !== fetchToken) return; // a newer request has superseded this one
+        if (!res.ok || data.error) {
+          wrap.innerHTML = `<div class="finder-empty">${escapeHtml(data.error || `Request failed (HTTP ${res.status}).`)}</div>`;
+          document.getElementById("finder-pagination").style.display = "none";
+          return;
+        }
+        renderCompanies(data);
+      } catch (e) {
+        if (token !== fetchToken) return;
+        wrap.innerHTML = `<div class="finder-empty">Couldn't reach the live service (${escapeHtml(e.message)}). It may still be waking up — try again shortly.</div>`;
+        document.getElementById("finder-pagination").style.display = "none";
+      }
+    }
+
+    document.getElementById("pg-prev").addEventListener("click", () => {
+      if (finderState.page > 1) { finderState.page--; fetchCompanies(); }
+    });
+    document.getElementById("pg-next").addEventListener("click", () => {
+      finderState.page++; fetchCompanies();
     });
 
+    async function initFinder() {
+      try {
+        const res = await fetch(`${API_BASE}/api/filters`);
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+        finderState.options = data;
+      } catch (e) {
+        document.getElementById("filter-groups-dynamic").innerHTML =
+          `<div class="finder-empty" style="padding:20px 14px;">Couldn't load filters (${escapeHtml(e.message)}).</div>`;
+      }
+
+      // Inject the two non-checkbox filter controls (website presence,
+      // city free-text) as their own small groups alongside the checkbox
+      // groups above, same collapsible-section look.
+      const extra = document.createElement("div");
+      extra.className = "filter-group";
+      extra.innerHTML = `
+        <div class="filter-group-head"><span>Website</span></div>
+        <div class="filter-group-body">
+          <div class="filter-option">
+            <input type="checkbox" id="no-website-toggle"/>
+            <label for="no-website-toggle">No website only</label>
+          </div>
+        </div>`;
+      const cityGroup = document.createElement("div");
+      cityGroup.className = "filter-group";
+      cityGroup.innerHTML = `
+        <div class="filter-group-head"><span>City</span></div>
+        <div class="filter-group-body">
+          <input type="text" id="city-filter-input" class="filter-search" style="margin-bottom:0;" placeholder="e.g. Columbus"/>
+        </div>`;
+
+      renderFilterGroups();
+      const staticContainer = document.getElementById("filter-groups-static");
+      staticContainer.appendChild(extra);
+      staticContainer.appendChild(cityGroup);
+
+      document.getElementById("no-website-toggle").addEventListener("change", (e) => {
+        finderState.noWebsiteOnly = e.target.checked;
+        finderState.page = 1;
+        renderActiveChips(); fetchCompanies();
+      });
+      let cityDebounce;
+      document.getElementById("city-filter-input").addEventListener("input", (e) => {
+        clearTimeout(cityDebounce);
+        cityDebounce = setTimeout(() => {
+          finderState.city = e.target.value.trim();
+          finderState.page = 1;
+          renderActiveChips(); fetchCompanies();
+        }, 350);
+      });
+
+      fetchCompanies();
+    }
+
     // =====================================================================
-    // Live chat — a real multi-chat chatbot, not a single question box.
-    // render-service itself holds no session state (it's a stateless API),
-    // so the "memory" lives entirely in this browser: every chat's full
-    // message history AND its last resolved search context (location,
-    // matched categories, radius, no-website flag) are persisted to
-    // localStorage, and the context is sent back to the server with every
-    // message in that chat so a follow-up ("list all of them", "now only
-    // ones with no website") can be resolved against it server-side
-    // (POST /api/chat's resolveWithContext). Multiple chats are fully
-    // independent — each has its own history and its own context.
+    // Live chat — secondary tab. Same multi-chat/localStorage design as
+    // before: render-service holds no session state, so each chat's full
+    // history AND its last resolved search context round-trip through
+    // localStorage + the server on every message.
     // =====================================================================
     const STORAGE_KEY = "companyScrapperChats";
 
@@ -287,10 +649,6 @@
       }
       saveChats();
       renderAll();
-    }
-
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     }
 
     function renderMessages() {
@@ -359,9 +717,6 @@
             if (data.context) chat.context = data.context;
           }
         } else {
-          // A real file (CSV/PDF) came back instead of JSON — download it,
-          // and recover the updated conversation context from the response
-          // header (a file response has no JSON body to carry it in).
           const blob = await res.blob();
           const disposition = res.headers.get("content-disposition") || "";
           const m = /filename="?([^"]+)"?/.exec(disposition);
@@ -393,6 +748,7 @@
 
     renderAll();
     loadStats();
+    initFinder();
   </script>
 </body>
 </html>

@@ -7,6 +7,8 @@ const cors = require("cors");
 const { shards, queryEachShard, queryAll } = require("./lib/db");
 const { getRealCategories, closeMatches } = require("./lib/categories");
 const { geocodeAddress } = require("./lib/geocode");
+const { getFilterOptions } = require("./lib/filters");
+const { searchCompanies } = require("./lib/companies");
 const { upsertBusinesses } = require("./lib/upsert");
 const {
   parseRequest, resolveWithContext, resolveModelIntent, decideDeliveryMode, buildChatReply, buildCsv, streamPdf,
@@ -184,6 +186,44 @@ app.get("/api/stats", async (_req, res) => {
 app.get("/api/categories", async (_req, res) => {
   try {
     res.json({ categories: await getRealCategories() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------------------------------------------------------------------
+// "Find companies" browse UI (Apollo-style: pick real filters from
+// checkboxes, see a paginated real result list) — these two routes back
+// it. /api/filters gives the UI every real, pickable filter VALUE (live,
+// never hardcoded); /api/companies runs the actual filtered+paginated
+// query. Both are plain GETs (filters are small enough for a query
+// string) so a filtered page is a shareable/bookmarkable/back-button-able
+// URL, same as Apollo's own "Find companies" page.
+// ---------------------------------------------------------------------
+app.get("/api/filters", async (_req, res) => {
+  try {
+    const [categories, { countries, regions, statuses }] = await Promise.all([
+      getRealCategories(), getFilterOptions(),
+    ]);
+    res.json({ categories, countries, regions, statuses });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/api/companies", async (req, res) => {
+  try {
+    const splitParam = (v) => (v ? String(v).split(",").map((s) => s.trim()).filter(Boolean) : []);
+    const filters = {
+      categories: splitParam(req.query.categories),
+      countries: splitParam(req.query.countries),
+      regions: splitParam(req.query.regions),
+      statuses: splitParam(req.query.statuses),
+      city: req.query.city ? String(req.query.city) : "",
+      noWebsiteOnly: req.query.no_website_only === "true" || req.query.no_website_only === "1",
+    };
+    const result = await searchCompanies(filters, req.query.page);
+    res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
