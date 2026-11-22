@@ -64,15 +64,23 @@ function stripLeadingFiller(text) {
   return stripWords(text, _LEAD_FILLER);
 }
 
-/** Scans every 1-4 word window of the remaining text for the one that
- * best fuzzy-matches a REAL category (via categoryScore, same scoring
- * used by closeMatches), so the split point is always anchored to real
- * data — never an invented guess at where the category ends and the
- * address begins. */
-function splitCategoryAndAddress(text, realCategories) {
-  const words = text.replace(/^[\s,.]+|[\s,.]+$/g, "").split(/\s+/).filter(Boolean);
-  if (words.length === 0) return { category: "", address: "" };
-
+/** Scans every 1-4 word window of `words` for the one that best
+ * fuzzy-matches a REAL category (via categoryScore, same scoring used
+ * by closeMatches), so a category phrase is always anchored to real
+ * data — never an invented guess. Shared by splitCategoryAndAddress
+ * (which also needs the leftover words as an address) and the count-
+ * query path (which just needs the category, ignoring noise words like
+ * "eligible for loans" that don't correspond to any real data field).
+ *
+ * A single-word window needs a real match, not a weak fuzzy brush-by —
+ * at live scale (2,000+ real categories) a short, generic word like
+ * "them" or "list" WILL incidentally clear a loose 0.45 bar against
+ * something in that large a vocabulary purely by chance, which is
+ * exactly what once turned a contentless follow-up ("list all of them")
+ * into a bogus category match instead of being recognized as having no
+ * real category/location content at all. */
+function findCategoryWindow(words, realCategories) {
+  if (words.length === 0) return null;
   const normCats = realCategories.map((c) => c.replace(/_/g, " ").toLowerCase());
   let bestScore = 0, bestSpan = null;
   for (let size = 1; size <= Math.min(4, words.length); size++) {
@@ -91,26 +99,29 @@ function splitCategoryAndAddress(text, realCategories) {
       }
     }
   }
-
-  // A single-word window needs a real match, not a weak fuzzy brush-by —
-  // at live scale (2,000+ real categories) a short, generic word like
-  // "them" or "list" WILL incidentally clear a loose 0.45 bar against
-  // something in that large a vocabulary purely by chance, which is
-  // exactly what turned a contentless follow-up ("list all of them")
-  // into a bogus category+address match instead of being recognized as
-  // having no real category/location content at all.
   const minScore = (bestSpan && bestSpan[1] - bestSpan[0] === 1) ? 0.55 : 0.45;
-  if (!bestSpan || bestScore < minScore) {
+  if (!bestSpan || bestScore < minScore) return null;
+  const [i0, i1] = bestSpan;
+  return {
+    category: words.slice(i0, i1).join(" ").replace(/^[\s,.]+|[\s,.]+$/g, ""),
+    remainderWords: [...words.slice(0, i0), ...words.slice(i1)],
+    leftoverWords: [...words.slice(0, i0), ...words.slice(i1)].filter(Boolean),
+  };
+}
+
+function splitCategoryAndAddress(text, realCategories) {
+  const words = text.replace(/^[\s,.]+|[\s,.]+$/g, "").split(/\s+/).filter(Boolean);
+  if (words.length === 0) return { category: "", address: "" };
+
+  const found = findCategoryWindow(words, realCategories);
+  if (!found) {
     const full = words.join(" ").replace(/^[\s,.]+|[\s,.]+$/g, "");
     return { category: "", address: _ADDRESS_HINT_RE.test(full) ? full : "" };
   }
 
-  const [i0, i1] = bestSpan;
-  const categoryPhrase = words.slice(i0, i1).join(" ").replace(/^[\s,.]+|[\s,.]+$/g, "");
-  const remainderWords = [...words.slice(0, i0), ...words.slice(i1)];
-  let remainder = stripWords(remainderWords.join(" "), _CONNECTORS);
+  let remainder = stripWords(found.remainderWords.join(" "), _CONNECTORS);
   remainder = remainder.replace(/\s{2,}/g, " ").replace(/^[\s,.]+|[\s,.]+$/g, "");
-  return { category: categoryPhrase, address: remainder };
+  return { category: found.category, address: remainder };
 }
 
 /** Extracts the structured pieces of a request from free text,
@@ -190,6 +201,40 @@ function resolveWithContext(parsed, matchedCategories, context) {
   };
 }
 
+/** Same merge semantics as resolveWithContext above, but driven by the
+ * worker model's structured intent object (lib/model_client.js) instead
+ * of the deterministic regex parser. Deliberately kept as a SEPARATE,
+ * parallel function rather than folded into resolveWithContext: the two
+ * callers pass differently-shaped inputs (a `parsed` object with a raw
+ * `category` string vs. an `intentObj` with an already-typo-corrected
+ * `category_phrase`), and keeping them apart means a change to one
+ * understanding layer's quirks never risks the other's behavior. The
+ * MERGE RULE itself is identical on purpose — "a named address starts
+ * fresh, everything else carries over from context" — because that rule
+ * is about how a multi-turn chat behaves, not about which layer
+ * extracted the fields. */
+function resolveModelIntent(intentObj, matchedCategories, context) {
+  if (intentObj.address) {
+    return {
+      address: intentObj.address,
+      matchedCategories,
+      radiusMiles: intentObj.radius_miles || 3,
+      noWebsiteOnly: !!intentObj.no_website_only,
+      needsGeocode: true,
+    };
+  }
+  if (!context) return null;
+  return {
+    address: context.address,
+    lat: context.lat,
+    lon: context.lon,
+    matchedCategories: matchedCategories.length ? matchedCategories : context.matchedCategories,
+    radiusMiles: intentObj.radius_miles || context.radiusMiles || 3,
+    noWebsiteOnly: !!intentObj.no_website_only || !!context.noWebsiteOnly,
+    needsGeocode: false,
+  };
+}
+
 // ---------------------------------------------------------------------
 // Count / aggregate questions — "how many coffee shops are in the
 // database", "number of pharmacies", "count of dental clinics ur
@@ -202,6 +247,12 @@ function resolveWithContext(parsed, matchedCategories, context) {
 // separately, with a real nationwide (no radius) count query.
 // ---------------------------------------------------------------------
 const _COUNT_RE = /\b(?:how many|number of|count of|total (?:number|count) of)\b/i;
+// Loose fallback: a message that LEADS with "number"/"count"/"total" is
+// almost always a count question even when the word that should follow
+// ("of") got mangled by autocorrect/swipe-typing — e.g. a real message
+// seen in practice, "Number 9f bakeries near me" (keyboard turned "of"
+// into "9f"). The exact phrase regex above would miss this entirely.
+const _COUNT_LOOSE_RE = /^\s*(?:number|count|total)\b/i;
 const _DB_FILLER_RE = /\s*(?:in|from|on|within)\s+(?:the|ur|your|our|my)?\s*(?:database|db|system|records?)\b\.?\s*$/i;
 // Generic helper/subject words that carry no category meaning of their
 // own ("are", "is", "businesses") — stripped wherever they appear, not
@@ -210,21 +261,64 @@ const _DB_FILLER_RE = /\s*(?:in|from|on|within)\s+(?:the|ur|your|our|my)?\s*(?:d
 const _GENERIC_SUBJECT_WORDS = /\b(?:are|is|there|do|does|we|you|have|has|business(?:es)?|compan(?:y|ies)|listed|available)\b/gi;
 
 function isCountQuery(message) {
-  return _COUNT_RE.test(message);
+  return _COUNT_RE.test(message) || _COUNT_LOOSE_RE.test(message);
 }
 
-/** Strips the count phrase itself ("how many", "number of"...), any
- * trailing "...in the database" filler, leading request filler, and
- * generic helper words with no category meaning — leaving (ideally)
- * just a category phrase: "how many coffee shops are in the database"
- * -> "coffee shops"; "how many businesses are in the database" -> ""
- * (meaning "everything", not an unmatchable literal category). */
-function extractCountSubject(message) {
-  let text = message.replace(_COUNT_RE, "").trim();
+/** Does the message ask for something tied to the asker's own physical
+ * location ("near me", "around me", "close to me", "by me")? This
+ * platform has no device/browser geolocation at all — there's no
+ * "me" to resolve — so sending that literal text to the geocoder just
+ * produces a confusing "no match" error. Checked explicitly so the
+ * error can say what's actually wrong instead. */
+const _NEAR_ME_RE = /\b(?:near|around|close to|by)\s+me\b/i;
+function isNearMeQuery(message) {
+  return _NEAR_ME_RE.test(message);
+}
+
+/** Strips the count phrase itself ("how many", "number of"... or the
+ * loose "number"/"count"/"total" lead-in, typo and all), any trailing
+ * "...in the database" filler, leading request filler, and generic
+ * helper words with no category meaning. Then runs the SAME real-
+ * category window search used for trade-area requests over whatever's
+ * left — so noise words that don't correspond to any real data field
+ * ("eligible for loans") are correctly dropped rather than sinking the
+ * whole match, same as a trade-area request tolerates noise around its
+ * category+address.
+ *
+ * Returns one of three shapes, distinguished on purpose rather than
+ * collapsed into "no category" for all of them:
+ *   - { category: null } — nothing was left to say at all ("how many
+ *     businesses are there") -> count EVERYTHING, not an error.
+ *   - { category, ignoredWords } — a real category was found; anything
+ *     left over (that didn't fit the real taxonomy) is reported, not
+ *     silently applied or silently dropped without a trace.
+ *   - { noMatch: true, text } — real-looking content remained but
+ *     nothing in it matched any real category ("unicorns"). This must
+ *     error out, not silently fall back to counting everything — that
+ *     would answer a different question than the one actually asked. */
+function extractCountSubject(message, realCategories) {
+  const exact = _COUNT_RE.exec(message);
+  let text;
+  if (exact) {
+    text = (message.slice(0, exact.index) + " " + message.slice(exact.index + exact[0].length)).trim();
+  } else {
+    // Loose match: drop the leading count word, then one short leftover
+    // token right after it (almost certainly "of" or a typo of it) — a
+    // real category window search below recovers gracefully even if
+    // this guess happens to eat part of a real word instead.
+    text = message.replace(/^\s*(?:number|count|total)\b\s*/i, "");
+    text = text.replace(/^[a-z0-9]{1,3}\b\s*/i, "");
+  }
   text = text.replace(_DB_FILLER_RE, "").trim();
   text = stripLeadingFiller(text);
   text = text.replace(_GENERIC_SUBJECT_WORDS, " ");
-  return text.replace(/\s{2,}/g, " ").replace(/^[\s,.?]+|[\s,.?]+$/g, "");
+  text = text.replace(/\s{2,}/g, " ").replace(/^[\s,.?]+|[\s,.?]+$/g, "");
+  if (!text) return { category: null, ignoredWords: [] };
+
+  const words = text.split(/\s+/).filter(Boolean);
+  const found = findCategoryWindow(words, realCategories);
+  if (!found) return { noMatch: true, text };
+  return { category: found.category, ignoredWords: found.leftoverWords };
 }
 
 // ---------------------------------------------------------------------
@@ -287,7 +381,7 @@ function buildChatReply({ address, matchedCategories, radiusMiles, summary, busi
 /** Natural-language reply for a count/aggregate question — built ONLY
  * from real numbers already computed by the caller's nationwide count
  * query, same "nothing fabricated" rule as buildChatReply. */
-function buildCountReply({ matchedCategories, total, noWebsite }) {
+function buildCountReply({ matchedCategories, total, noWebsite, ignoredWords }) {
   const catLabel = matchedCategories && matchedCategories.length
     ? pluralizeLabel(matchedCategories.map((c) => c.replace(/_/g, " ")).join(", "), total)
     : "businesses";
@@ -295,6 +389,12 @@ function buildCountReply({ matchedCategories, total, noWebsite }) {
   const lines = [`There ${verb} ${total.toLocaleString()} ${catLabel} in the database.`];
   if (total > 0) {
     lines.push(`${noWebsite.toLocaleString()} of them have no website on file.`);
+  }
+  if (ignoredWords && ignoredWords.length) {
+    lines.push(
+      `(Note: this only counts by category — I don't have a way to filter by "${ignoredWords.join(" ")}", `
+      + `so that part of your question wasn't applied.)`
+    );
   }
   return lines.join("\n");
 }
@@ -366,11 +466,13 @@ function streamPdf(res, { address, matchedCategories, radiusMiles, summary, busi
 module.exports = {
   parseRequest,
   resolveWithContext,
+  resolveModelIntent,
   decideDeliveryMode,
   buildChatReply,
   buildCsv,
   streamPdf,
   isCountQuery,
+  isNearMeQuery,
   extractCountSubject,
   buildCountReply,
   // exported for testing

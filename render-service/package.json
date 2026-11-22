@@ -2,7 +2,7 @@
   "name": "company-scrapper-service",
   "version": "1.0.0",
   "private": true,
-  "description": "Always-on API for the Researchers/Company Scrapper AI — reads/writes the live Prisma Postgres business store and exposes trade-area search (deterministic: real geocoding + real fuzzy category matching, no LLM call anywhere in this service).",
+  "description": "Always-on API for the Researchers/Company Scrapper AI — reads/writes the live Prisma Postgres business store and exposes trade-area search and a live chatbot. Understanding free-text chat messages is handled by OUR OWN fine-tuned worker model (workers/researchers-company-scrapper-chat/, stacked on the project's template adapter), never a third-party LLM, with a deterministic regex parser as an automatic fallback whenever that model is unavailable. Real geocoding + real fuzzy category matching + the actual database queries are always deterministic either way.",
   "type": "commonjs",
   "main": "server.js",
   "engines": {
