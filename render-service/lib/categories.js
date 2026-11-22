@@ -110,6 +110,35 @@ function fuzzyWordOverlap(termSet, catSet) {
   return matched;
 }
 
+/** Whole-WORD containment — is `small`'s word sequence a contiguous
+ * subsequence of `big`'s words? Deliberately NOT a raw string .includes()
+ * (see containsPhrase below for why that was a real bug). */
+function containsWordSeq(bigWords, smallWords) {
+  if (smallWords.length === 0 || smallWords.length > bigWords.length) return false;
+  for (let i = 0; i <= bigWords.length - smallWords.length; i++) {
+    let ok = true;
+    for (let j = 0; j < smallWords.length; j++) {
+      if (bigWords[i + j] !== smallWords[j]) { ok = false; break; }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+/** Whole-word phrase containment between two already-lowercased,
+ * space-separated phrases. Replaces a raw String.includes() check that
+ * was a real, live bug: "of".includes-tested against "coffee shop"
+ * scored 0.9 because the LETTERS "o"+"f" happen to appear back-to-back
+ * inside "coffee" — a pure substring coincidence with zero relation to
+ * the actual word "of". That one bug alone let a two-letter stopword in
+ * a contentless follow-up message ("list all OF them") get silently
+ * treated as a confident category match. Word-boundary containment
+ * ("coffee" is contained in "coffee shop", "of" is not) is the correct
+ * semantics this check was always meant to have. */
+function containsPhrase(bigPhrase, smallPhrase) {
+  return containsWordSeq(bigPhrase.split(/\s+/), smallPhrase.split(/\s+/));
+}
+
 /** Word-identity-first scoring, NOT raw character similarity. Exact or
  * singularized-word-set matches score highest; character ratio
  * (similarity above) is kept only as a heavily-discounted fallback for
@@ -121,7 +150,7 @@ function categoryScore(term, normCat) {
   const termSet = singularizeWords(term);
   const catSet = singularizeWords(normCat);
   if (sameSet(termSet, catSet)) return 1;
-  if (normCat.includes(term) || term.includes(normCat)) return 0.9;
+  if (containsPhrase(normCat, term) || containsPhrase(term, normCat)) return 0.9;
   const union = new Set([...termSet, ...catSet]);
   const overlap = fuzzyWordOverlap(termSet, catSet);
   const jaccard = union.size ? overlap / union.size : 0;

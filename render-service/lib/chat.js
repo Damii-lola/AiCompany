@@ -28,6 +28,16 @@ const _LEAD_FILLER = [
   "find", "search for", "get me", "show me", "look for", "i need", "i want",
 ];
 const _CONNECTORS = ["near", "around", "in", "of", "with", "for", "at"];
+// A real address has at least one of: a number (street number or zip), a
+// "City, ST" comma-state pattern, or a street-suffix word. Used ONLY to
+// gate the no-category-matched fallback below — without this, any
+// contentless follow-up ("list all of them", "give me that as a csv")
+// got its entire leftover text dumped into "address" by default and
+// treated as a brand-new location to geocode, which both produced
+// nonsense geocoder lookups and (worse, once conversation context was
+// added) wrongly told resolveWithContext "this message names its own
+// new place," discarding the real context it should have fallen back on.
+const _ADDRESS_HINT_RE = /\d{2,}|,\s*[A-Za-z]{2}\b|\b(?:street|st\.?|avenue|ave\.?|road|rd\.?|drive|dr\.?|boulevard|blvd\.?|lane|ln\.?|way|highway|hwy|parkway|pkwy)\b/i;
 
 /** Strips any of `words` repeatedly from the START of text — handles the
  * case where a connector word ("near") IS the very first word left over
@@ -82,8 +92,17 @@ function splitCategoryAndAddress(text, realCategories) {
     }
   }
 
-  if (!bestSpan || bestScore < 0.45) {
-    return { category: "", address: words.join(" ").replace(/^[\s,.]+|[\s,.]+$/g, "") };
+  // A single-word window needs a real match, not a weak fuzzy brush-by —
+  // at live scale (2,000+ real categories) a short, generic word like
+  // "them" or "list" WILL incidentally clear a loose 0.45 bar against
+  // something in that large a vocabulary purely by chance, which is
+  // exactly what turned a contentless follow-up ("list all of them")
+  // into a bogus category+address match instead of being recognized as
+  // having no real category/location content at all.
+  const minScore = (bestSpan && bestSpan[1] - bestSpan[0] === 1) ? 0.55 : 0.45;
+  if (!bestSpan || bestScore < minScore) {
+    const full = words.join(" ").replace(/^[\s,.]+|[\s,.]+$/g, "");
+    return { category: "", address: _ADDRESS_HINT_RE.test(full) ? full : "" };
   }
 
   const [i0, i1] = bestSpan;
@@ -125,6 +144,49 @@ function parseRequest(nlRequest, realCategories) {
     category,
     country: "US", // this whole platform only scans the US + SBA-lending territories
     no_website_only: noWebsiteOnly,
+  };
+}
+
+/** Conversation-memory follow-up resolution — deterministic, not an LLM
+ * guess: a chat is a sequence of turns, and a follow-up like "list all
+ * of them" or "now show me only the ones with no website" or "what
+ * about within 5 miles instead" has no location/category of its own on
+ * purpose — it's referring BACK to whatever the previous turn already
+ * resolved. `context` is the previous turn's resolved spec (address,
+ * lat/lon, matchedCategories, radiusMiles, noWebsiteOnly), round-
+ * tripped by the client every request (render-service itself holds no
+ * server-side session state — the browser's own chat history is the
+ * source of truth, same as this file's design elsewhere: nothing here
+ * decides the final answer on a guess).
+ *
+ * Rule: if the new message names its OWN address, it's a fresh query —
+ * context is dropped entirely (predictable: a new place always starts
+ * clean). Otherwise, whatever the new message DID detect (a new
+ * category, a new radius, a no-website toggle) overrides the matching
+ * field in context; anything it didn't mention carries over unchanged.
+ * A message with nothing new at all ("list all of them") carries over
+ * everything — that's the exact case that used to crash. */
+function resolveWithContext(parsed, matchedCategories, context) {
+  if (parsed.address) {
+    // A real new location was named — fresh query, no carryover at all.
+    return {
+      address: parsed.address,
+      matchedCategories,
+      radiusMiles: parsed.radius_miles || 3,
+      noWebsiteOnly: parsed.no_website_only,
+      needsGeocode: true,
+    };
+  }
+  if (!context) return null; // nothing of its own and nothing to fall back on
+
+  return {
+    address: context.address,
+    lat: context.lat,
+    lon: context.lon,
+    matchedCategories: matchedCategories.length ? matchedCategories : context.matchedCategories,
+    radiusMiles: parsed.radius_miles || context.radiusMiles || 3,
+    noWebsiteOnly: parsed.no_website_only || !!context.noWebsiteOnly,
+    needsGeocode: false,
   };
 }
 
@@ -303,6 +365,7 @@ function streamPdf(res, { address, matchedCategories, radiusMiles, summary, busi
 
 module.exports = {
   parseRequest,
+  resolveWithContext,
   decideDeliveryMode,
   buildChatReply,
   buildCsv,

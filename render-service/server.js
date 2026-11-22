@@ -9,7 +9,7 @@ const { getRealCategories, closeMatches } = require("./lib/categories");
 const { geocodeAddress } = require("./lib/geocode");
 const { upsertBusinesses } = require("./lib/upsert");
 const {
-  parseRequest, decideDeliveryMode, buildChatReply, buildCsv, streamPdf,
+  parseRequest, resolveWithContext, decideDeliveryMode, buildChatReply, buildCsv, streamPdf,
   isCountQuery, extractCountSubject, buildCountReply,
 } = require("./lib/chat");
 
@@ -239,7 +239,7 @@ app.post("/api/research", async (req, res) => {
 // ---------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
-    const { message } = req.body || {};
+    const { message, context } = req.body || {};
     if (!message || typeof message !== "string" || !message.trim()) {
       return res.status(400).json({ error: "Body must include a non-empty 'message'." });
     }
@@ -288,15 +288,24 @@ app.post("/api/chat", async (req, res) => {
 
     const parsed = parseRequest(message, realCategories);
 
-    if (!parsed.address) {
+    // Category matching happens up front (even for a follow-up with no
+    // new address) so resolveWithContext can tell "this message DID name
+    // a new category" (e.g. "what about pharmacies instead") apart from
+    // "this message named nothing new" (e.g. "list all of them") — the
+    // latter is the exact case that used to misfire into a geocode call
+    // on garbage text. closeMatches("") always returns [] cleanly, so
+    // this is safe to call even when parsed.category is empty.
+    const freshCategories = parsed.category ? closeMatches(parsed.category, realCategories) : [];
+
+    const resolved = resolveWithContext(parsed, freshCategories, context);
+    if (!resolved) {
       return res.status(422).json({
         error: "Couldn't find a location in that request — include an address, city, or place name "
-          + "(e.g. \"coffee shops with no website within 2 miles of 123 Main St, Columbus, OH\").",
+          + "(e.g. \"coffee shops with no website within 2 miles of 123 Main St, Columbus, OH\"). "
+          + "If you meant to follow up on an earlier search, that context wasn't included with this request.",
       });
     }
-
-    const matchedCategories = closeMatches(parsed.category, realCategories);
-    if (matchedCategories.length === 0) {
+    if (resolved.matchedCategories.length === 0) {
       return res.status(422).json({
         error: `Could not match "${parsed.category}" to any real category in the live database — `
           + `try a different or more specific term rather than searching everything.`,
@@ -304,16 +313,28 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    const { lat, lon } = await geocodeAddress(parsed.address);
-    const radiusMiles = parsed.radius_miles || 3;
+    let { lat, lon } = resolved;
+    if (resolved.needsGeocode) {
+      ({ lat, lon } = await geocodeAddress(resolved.address));
+    }
+
     const { businesses, summary } = await tradeAreaFanOut(
-      lat, lon, radiusMiles, matchedCategories, parsed.no_website_only, parsed.country
+      lat, lon, resolved.radiusMiles, resolved.matchedCategories, resolved.noWebsiteOnly, parsed.country
     );
 
     const mode = decideDeliveryMode(message);
     const payload = {
-      address: parsed.address, matchedCategories, radiusMiles, summary, businesses,
-      noWebsiteOnly: parsed.no_website_only,
+      address: resolved.address, matchedCategories: resolved.matchedCategories,
+      radiusMiles: resolved.radiusMiles, summary, businesses, noWebsiteOnly: resolved.noWebsiteOnly,
+    };
+    // Carried back to the client on EVERY response (JSON or file) so the
+    // next turn in this chat — even right after a CSV/PDF download — can
+    // resolve a follow-up against it. This is the chat's only "memory":
+    // render-service itself holds no server-side session state, the
+    // client's own conversation history is the source of truth.
+    const nextContext = {
+      address: resolved.address, lat, lon, matchedCategories: resolved.matchedCategories,
+      radiusMiles: resolved.radiusMiles, noWebsiteOnly: resolved.noWebsiteOnly,
     };
 
     if (mode === "csv" || mode === "xlsx") {
@@ -323,20 +344,25 @@ app.post("/api/chat", async (req, res) => {
       // returning JSON when a file was explicitly requested.
       res.setHeader("Content-Type", "text/csv");
       res.setHeader("Content-Disposition", 'attachment; filename="trade_area_snapshot.csv"');
+      res.setHeader("X-Chat-Context", Buffer.from(JSON.stringify(nextContext)).toString("base64"));
+      res.setHeader("Access-Control-Expose-Headers", "X-Chat-Context, Content-Disposition");
       return res.send(buildCsv(businesses));
     }
     if (mode === "pdf") {
+      res.setHeader("X-Chat-Context", Buffer.from(JSON.stringify(nextContext)).toString("base64"));
+      res.setHeader("Access-Control-Expose-Headers", "X-Chat-Context, Content-Disposition");
       return streamPdf(res, payload);
     }
 
     res.json({
       mode: "chat",
       reply: buildChatReply(payload),
-      matched_categories: matchedCategories,
+      matched_categories: resolved.matchedCategories,
       center: { lat, lon },
-      radius_miles: radiusMiles,
+      radius_miles: resolved.radiusMiles,
       summary,
       businesses,
+      context: nextContext,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
