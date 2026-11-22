@@ -18,7 +18,6 @@
     --accent-dim: #3a3a8c;
     --accent-bg: rgba(108, 108, 245, 0.12);
     --danger: #ff6b6b;
-    --danger-bg: #3a1d1f;
     --radius: 10px;
   }
   * { box-sizing: border-box; }
@@ -48,28 +47,20 @@
   .stat .n { font-size: 1.4rem; font-weight: 700; display: block; }
   .stat .l { font-size: 0.75rem; color: var(--text-dim); }
 
-  /* --- Tabs --- */
-  .tabs { display: flex; gap: 4px; margin: 4px 24px 0; border-bottom: 1px solid var(--border); }
-  .tab-btn { background: none; border: none; color: var(--text-dim); font-size: 0.9rem;
-             padding: 10px 14px; border-bottom: 2px solid transparent; }
-  .tab-btn.active { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
-  .tab-btn:hover { color: var(--text); }
-  .tab-panel { display: none; }
-  .tab-panel.active { display: block; }
-
   /* ===================================================================
      Find Companies — Apollo-style filter sidebar + paginated result
-     table. This is the PRIMARY way to find companies now: every filter
-     value comes from GET /api/filters (real, live database values —
-     never a hardcoded guess), and the result table is GET /api/companies,
-     a real paginated+filtered query, 30 real rows per page.
+     table. This is the ONLY way to find companies: every filter value
+     comes from GET /api/filters (real, live database values — never a
+     hardcoded guess), and the result table is GET /api/companies, a
+     real paginated+filtered query, 30 real rows per page. There is
+     deliberately no free-text/chat search anywhere on this page.
      =================================================================== */
-  .finder { display: flex; align-items: flex-start; gap: 0; margin: 0 24px 24px;
+  .finder { display: flex; align-items: flex-start; gap: 0; margin: 10px 24px 24px;
             border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
-            background: var(--panel); min-height: 70vh; }
+            background: var(--panel); min-height: 74vh; }
 
   .finder-sidebar { width: 260px; flex-shrink: 0; border-right: 1px solid var(--border);
-                     max-height: 78vh; overflow-y: auto; }
+                     max-height: 82vh; overflow-y: auto; }
   .finder-sidebar-head { display: flex; align-items: center; justify-content: space-between;
                           padding: 12px 14px; border-bottom: 1px solid var(--border); }
   .finder-sidebar-head strong { font-size: 0.85rem; }
@@ -97,7 +88,7 @@
 
   .finder-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   .finder-top { display: flex; align-items: center; justify-content: space-between;
-                padding: 12px 18px; border-bottom: 1px solid var(--border); }
+                padding: 12px 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; gap: 8px; }
   .finder-total { font-size: 0.9rem; }
   .finder-total strong { font-weight: 700; }
   .finder-top .active-chips { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -135,38 +126,6 @@
     .finder { flex-direction: column; }
     .finder-sidebar { width: 100%; max-height: 240px; border-right: none; border-bottom: 1px solid var(--border); }
   }
-
-  /* --- Chat (secondary tab) --- */
-  .chat-app { display: flex; gap: 0; border: 1px solid var(--border); border-radius: 12px;
-              overflow: hidden; height: 560px; margin: 0 24px 24px; background: var(--panel); }
-  .chat-sidebar { width: 220px; flex-shrink: 0; background: var(--panel-2); border-right: 1px solid var(--border);
-                  display: flex; flex-direction: column; }
-  .chat-sidebar .new-chat-btn { margin: 10px; padding: 9px 12px; border-radius: 8px; border: none;
-                  background: var(--accent); color: #fff; font-size: 0.85rem; text-align: left; }
-  .chat-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
-  .chat-list-item { padding: 9px 10px; border-radius: 8px; font-size: 0.85rem; cursor: pointer;
-                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                     display: flex; align-items: center; gap: 6px; }
-  .chat-list-item:hover { background: #20222b; }
-  .chat-list-item.active { background: var(--accent-bg); color: var(--accent); font-weight: 600; }
-  .chat-list-item .del { margin-left: auto; opacity: 0; font-size: 0.75rem; color: var(--text-dim); }
-  .chat-list-item:hover .del { opacity: 1; }
-  .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
-  .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; font-size: 0.88rem; white-space: pre-wrap; }
-  .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 3px; }
-  .msg.assistant { align-self: flex-start; background: var(--panel-2); border-bottom-left-radius: 3px; }
-  .msg.assistant.is-error { background: var(--danger-bg); color: var(--danger); }
-  .chat-empty { margin: auto; text-align: center; color: var(--text-dim); font-size: 0.9rem; max-width: 320px; }
-  .chat-input-row { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
-  .chat-input-row input[type=text] { flex: 1; min-width: 0; }
-  .chat-input-row button { padding: 10px 16px; border-radius: 8px; border: none;
-                            background: var(--accent); color: #fff; font-size: 0.9rem; }
-  .chat-input-row button:disabled { opacity: 0.5; }
-  @media (max-width: 640px) {
-    .chat-app { flex-direction: column; height: 640px; }
-    .chat-sidebar { width: 100%; height: 130px; border-right: none; border-bottom: 1px solid var(--border); }
-  }
 </style>
 </head>
 <body>
@@ -182,54 +141,27 @@
     <div class="stat"><span class="n">—</span><span class="l">last updated</span></div>
   </div>
 
-  <div class="tabs">
-    <button class="tab-btn active" data-tab="finder">Find Companies</button>
-    <button class="tab-btn" data-tab="chat">Chat</button>
-  </div>
-
-  <!-- ================= Find Companies ================= -->
-  <div class="tab-panel active" id="tab-finder">
-    <div class="finder">
-      <div class="finder-sidebar" id="finder-sidebar">
-        <div class="finder-sidebar-head">
-          <strong>Filters</strong>
-          <button class="clear-link" id="clear-filters-btn" disabled>Clear all</button>
-        </div>
-        <div id="filter-groups-dynamic"><div class="finder-loading">Loading filters…</div></div>
-        <div id="filter-groups-static"></div>
+  <div class="finder">
+    <div class="finder-sidebar" id="finder-sidebar">
+      <div class="finder-sidebar-head">
+        <strong>Filters</strong>
+        <button class="clear-link" id="clear-filters-btn" disabled>Clear all</button>
       </div>
-      <div class="finder-main">
-        <div class="finder-top">
-          <div class="finder-total" id="finder-total">Loading…</div>
-          <div class="active-chips" id="active-chips"></div>
-        </div>
-        <div class="table-wrap" id="table-wrap">
-          <div class="finder-loading">Loading companies…</div>
-        </div>
-        <div class="finder-pagination" id="finder-pagination" style="display:none;">
-          <button id="pg-prev">‹ Prev</button>
-          <span id="pg-label"></span>
-          <button id="pg-next">Next ›</button>
-        </div>
-      </div>
+      <div id="filter-groups-dynamic"><div class="finder-loading">Loading filters…</div></div>
+      <div id="filter-groups-static"></div>
     </div>
-  </div>
-
-  <!-- ================= Chat ================= -->
-  <div class="tab-panel" id="tab-chat">
-    <p class="sub" style="margin:0 24px 10px;">Ask it anything — a plain-English request, a count
-      question, or a follow-up on an earlier answer. Each chat remembers its own conversation.</p>
-    <div class="chat-app">
-      <div class="chat-sidebar">
-        <button class="new-chat-btn" id="new-chat-btn">+ New chat</button>
-        <div class="chat-list" id="chat-list"></div>
+    <div class="finder-main">
+      <div class="finder-top">
+        <div class="finder-total" id="finder-total">Loading…</div>
+        <div class="active-chips" id="active-chips"></div>
       </div>
-      <div class="chat-main">
-        <div class="chat-messages" id="chat-messages"></div>
-        <form class="chat-input-row" id="chat-form">
-          <input type="text" id="chat-input" placeholder="coffee shops near Denver, CO within 5 miles" autocomplete="off" />
-          <button type="submit" id="chat-send-btn">Send</button>
-        </form>
+      <div class="table-wrap" id="table-wrap">
+        <div class="finder-loading">Loading companies…</div>
+      </div>
+      <div class="finder-pagination" id="finder-pagination" style="display:none;">
+        <button id="pg-prev">‹ Prev</button>
+        <span id="pg-label"></span>
+        <button id="pg-next">Next ›</button>
       </div>
     </div>
   </div>
@@ -237,18 +169,6 @@
   <script>
     // Update this if the Render service's URL ever changes.
     const API_BASE = "https://aicompany-tmg7.onrender.com";
-
-    // =====================================================================
-    // Tabs
-    // =====================================================================
-    document.querySelectorAll(".tab-btn").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll(".tab-btn").forEach((b) => b.classList.remove("active"));
-        document.querySelectorAll(".tab-panel").forEach((p) => p.classList.remove("active"));
-        btn.classList.add("active");
-        document.getElementById("tab-" + btn.dataset.tab).classList.add("active");
-      });
-    });
 
     async function loadStats() {
       try {
@@ -582,171 +502,6 @@
       fetchCompanies();
     }
 
-    // =====================================================================
-    // Live chat — secondary tab. Same multi-chat/localStorage design as
-    // before: render-service holds no session state, so each chat's full
-    // history AND its last resolved search context round-trip through
-    // localStorage + the server on every message.
-    // =====================================================================
-    const STORAGE_KEY = "companyScrapperChats";
-
-    function loadChats() {
-      try {
-        const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          if (parsed && Array.isArray(parsed.chats) && parsed.chats.length) return parsed;
-        }
-      } catch (e) { /* corrupt or inaccessible storage — fall through to a fresh start */ }
-      const chat = newChatObject();
-      return { chats: [chat], activeChatId: chat.id };
-    }
-
-    function saveChats() {
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { /* storage full/blocked — chat still works this session */ }
-    }
-
-    function newChatObject() {
-      return { id: "c" + Date.now() + Math.random().toString(36).slice(2, 7), title: "New chat", messages: [], context: null };
-    }
-
-    let state = loadChats();
-
-    function activeChat() {
-      return state.chats.find((c) => c.id === state.activeChatId) || state.chats[0];
-    }
-
-    function renderSidebar() {
-      const list = document.getElementById("chat-list");
-      list.innerHTML = "";
-      for (const chat of state.chats) {
-        const item = document.createElement("div");
-        item.className = "chat-list-item" + (chat.id === state.activeChatId ? " active" : "");
-        item.innerHTML = `<span style="overflow:hidden;text-overflow:ellipsis;">${escapeHtml(chat.title)}</span>` +
-          (state.chats.length > 1 ? `<span class="del" title="Delete chat">✕</span>` : "");
-        item.addEventListener("click", (e) => {
-          if (e.target.classList.contains("del")) {
-            e.stopPropagation();
-            deleteChat(chat.id);
-            return;
-          }
-          state.activeChatId = chat.id;
-          saveChats();
-          renderAll();
-        });
-        list.appendChild(item);
-      }
-    }
-
-    function deleteChat(id) {
-      state.chats = state.chats.filter((c) => c.id !== id);
-      if (state.chats.length === 0) {
-        const fresh = newChatObject();
-        state.chats = [fresh];
-        state.activeChatId = fresh.id;
-      } else if (state.activeChatId === id) {
-        state.activeChatId = state.chats[0].id;
-      }
-      saveChats();
-      renderAll();
-    }
-
-    function renderMessages() {
-      const box = document.getElementById("chat-messages");
-      box.innerHTML = "";
-      const chat = activeChat();
-      if (chat.messages.length === 0) {
-        box.innerHTML = `<div class="chat-empty">Ask about businesses in the live database — a location + category
-          ("coffee shops near Denver, CO"), a count ("how many pharmacies are there"), or a follow-up on
-          whatever you just asked.</div>`;
-        return;
-      }
-      for (const m of chat.messages) {
-        const div = document.createElement("div");
-        div.className = "msg " + m.role + (m.isError ? " is-error" : "");
-        div.textContent = m.text;
-        box.appendChild(div);
-      }
-      box.scrollTop = box.scrollHeight;
-    }
-
-    function renderAll() {
-      renderSidebar();
-      renderMessages();
-    }
-
-    document.getElementById("new-chat-btn").addEventListener("click", () => {
-      const chat = newChatObject();
-      state.chats.unshift(chat);
-      state.activeChatId = chat.id;
-      saveChats();
-      renderAll();
-      document.getElementById("chat-input").focus();
-    });
-
-    document.getElementById("chat-form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const input = document.getElementById("chat-input");
-      const btn = document.getElementById("chat-send-btn");
-      const message = input.value.trim();
-      if (!message) return;
-
-      const chat = activeChat();
-      chat.messages.push({ role: "user", text: message });
-      if (chat.title === "New chat") chat.title = message.length > 40 ? message.slice(0, 40) + "…" : message;
-      saveChats();
-      renderAll();
-      input.value = "";
-      btn.disabled = true;
-      btn.textContent = "...";
-
-      try {
-        const res = await fetch(`${API_BASE}/api/chat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ message, context: chat.context }),
-        });
-
-        const contentType = res.headers.get("content-type") || "";
-        if (contentType.includes("application/json")) {
-          const data = await res.json();
-          if (!res.ok || data.error) {
-            chat.messages.push({ role: "assistant", text: data.error || `Request failed (HTTP ${res.status}).`, isError: true });
-          } else {
-            chat.messages.push({ role: "assistant", text: data.reply });
-            if (data.context) chat.context = data.context;
-          }
-        } else {
-          const blob = await res.blob();
-          const disposition = res.headers.get("content-disposition") || "";
-          const m = /filename="?([^"]+)"?/.exec(disposition);
-          const filename = m ? m[1] : "trade_area_snapshot";
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = filename;
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          URL.revokeObjectURL(url);
-          const ctxHeader = res.headers.get("x-chat-context");
-          if (ctxHeader) {
-            try { chat.context = JSON.parse(atob(ctxHeader)); } catch (e) { /* keep previous context if this is unreadable */ }
-          }
-          chat.messages.push({ role: "assistant", text: `Downloaded ${filename}.` });
-        }
-      } catch (err) {
-        chat.messages.push({ role: "assistant", text: `Request failed: ${err.message}`, isError: true });
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Send";
-        saveChats();
-        renderAll();
-        input.focus();
-      }
-    });
-
-    renderAll();
     loadStats();
     initFinder();
   </script>
