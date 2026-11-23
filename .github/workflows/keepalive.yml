@@ -1,0 +1,28 @@
+name: Keep Company Scrapper service warm
+
+# Render's free tier spins the web service down to zero after a stretch
+# of no traffic, and the FIRST request after that has to wait for it to
+# cold-boot — often 30-60+ seconds, which is most of why the live site
+# felt "soooooo slow". This job just pings the service's own /health
+# route often enough that it never gets the chance to fully sleep, so a
+# real visitor's request almost always lands on an already-warm
+# instance. It costs nothing (this repo is public, so Actions minutes
+# are free and unlimited) and needs no secrets — /health is a public,
+# unauthenticated route.
+#
+# 10 minutes is comfortably inside Render free tier's ~15-minute idle
+# window, so this alone should keep the service warm around the clock.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 minutes, all day, every day
+  workflow_dispatch: {}        # lets you trigger a ping by hand from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /health
+        run: |
+          curl -sS -o /dev/null -w "HTTP %{http_code}, %{time_total}s\n" \
+            https://aicompany-tmg7.onrender.com/health || true

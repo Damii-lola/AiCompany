@@ -147,7 +147,7 @@
         <strong>Filters</strong>
         <button class="clear-link" id="clear-filters-btn" disabled>Clear all</button>
       </div>
-      <div id="filter-groups-dynamic"><div class="finder-loading">Loading filters…</div></div>
+      <div id="filter-groups-dynamic"><div class="finder-loading" id="filters-loading-msg">Loading filters…</div></div>
       <div id="filter-groups-static"></div>
     </div>
     <div class="finder-main">
@@ -169,6 +169,21 @@
   <script>
     // Update this if the Render service's URL ever changes.
     const API_BASE = "https://aicompany-tmg7.onrender.com";
+
+    // The free Render instance behind API_BASE can spin down after a
+    // stretch of no traffic, and the first request to wake it back up
+    // can take anywhere from several seconds to roughly a minute — real
+    // network time, not a bug. Left as a bare "Loading…" the whole way
+    // through, that reads as frozen. This swaps in an explicit "waking
+    // up" message once a request has been pending a few seconds, so the
+    // wait reads as expected instead of broken, and clears the timer the
+    // instant the real response lands.
+    const WAKEUP_DELAY_MS = 4000;
+    function withWakeupNotice(targetEl, normalHtml, wakeupHtml) {
+      targetEl.innerHTML = normalHtml;
+      const timer = setTimeout(() => { targetEl.innerHTML = wakeupHtml; }, WAKEUP_DELAY_MS);
+      return () => clearTimeout(timer);
+    }
 
     async function loadStats() {
       try {
@@ -412,7 +427,11 @@
     async function fetchCompanies() {
       const token = ++fetchToken;
       const wrap = document.getElementById("table-wrap");
-      wrap.innerHTML = `<div class="finder-loading">Loading companies…</div>`;
+      const cancelWakeupNotice = withWakeupNotice(
+        wrap,
+        `<div class="finder-loading">Loading companies…</div>`,
+        `<div class="finder-loading">Still loading — our free server may be waking up from sleep. This can take up to a minute on the first visit after a quiet stretch, then it's fast again.</div>`
+      );
       updateClearButton();
 
       const qp = new URLSearchParams();
@@ -426,6 +445,7 @@
       try {
         const res = await fetch(`${API_BASE}/api/companies?${qp.toString()}`);
         const data = await res.json();
+        cancelWakeupNotice();
         if (token !== fetchToken) return; // a newer request has superseded this one
         if (!res.ok || data.error) {
           wrap.innerHTML = `<div class="finder-empty">${escapeHtml(data.error || `Request failed (HTTP ${res.status}).`)}</div>`;
@@ -434,6 +454,7 @@
         }
         renderCompanies(data);
       } catch (e) {
+        cancelWakeupNotice();
         if (token !== fetchToken) return;
         wrap.innerHTML = `<div class="finder-empty">Couldn't reach the live service (${escapeHtml(e.message)}). It may still be waking up — try again shortly.</div>`;
         document.getElementById("finder-pagination").style.display = "none";
@@ -448,12 +469,19 @@
     });
 
     async function initFinder() {
+      const cancelWakeupNotice = withWakeupNotice(
+        document.getElementById("filters-loading-msg").parentElement,
+        `<div class="finder-loading" id="filters-loading-msg">Loading filters…</div>`,
+        `<div class="finder-loading" id="filters-loading-msg">Still loading — our free server may be waking up from sleep. This can take up to a minute on the first visit after a quiet stretch.</div>`
+      );
       try {
         const res = await fetch(`${API_BASE}/api/filters`);
         const data = await res.json();
+        cancelWakeupNotice();
         if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
         finderState.options = data;
       } catch (e) {
+        cancelWakeupNotice();
         document.getElementById("filter-groups-dynamic").innerHTML =
           `<div class="finder-empty" style="padding:20px 14px;">Couldn't load filters (${escapeHtml(e.message)}).</div>`;
       }

@@ -98,6 +98,31 @@ create index if not exists idx_businesses_no_website on businesses (id) where (w
 create index if not exists idx_businesses_earth on businesses using gist (ll_to_earth(lat, lon));
 
 -- ---------------------------------------------------------------------
+-- Find-companies performance indexes (added after the live "Find
+-- Companies" page was reported slow). searchCompanies() in
+-- render-service/lib/companies.js always does `ORDER BY name ... LIMIT N`
+-- on businesses_readable — with NO index on name, that forced Postgres
+-- to sequentially scan and sort the ENTIRE businesses table (millions of
+-- rows per shard) on every single page load, including the very first,
+-- filter-free load every visitor hits. idx_businesses_name alone turns
+-- that into a cheap index-ordered scan that stops after the first 30-ish
+-- rows. The two composite indexes do the same for the (very common)
+-- case of filtering by one category or one location and then still
+-- sorting by name — without them, Postgres filters first (fast, using
+-- idx_businesses_category/location) but then still has to sort the
+-- filtered rows by name from scratch; with them, rows already come out
+-- in name order for that filter, so no separate sort step is needed.
+-- idx_businesses_status does for the operating-status checkbox filter
+-- what idx_businesses_category/location already did for those two.
+-- Run this file again against EVERY shard database (it's all
+-- `if not exists`, so re-running is always safe) — these indexes do not
+-- exist yet on any shard created before this file was updated.
+create index if not exists idx_businesses_status on businesses (status_id);
+create index if not exists idx_businesses_name on businesses (name);
+create index if not exists idx_businesses_category_name on businesses (category_id, name);
+create index if not exists idx_businesses_location_name on businesses (location_id, name);
+
+-- ---------------------------------------------------------------------
 -- Convenience view — gives back the same flat, human-readable shape the
 -- old Supabase table had (real text, not ids). Render's API reads through
 -- this so its query code barely changes, and the storage win is entirely

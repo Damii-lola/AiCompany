@@ -64,18 +64,34 @@ app.get("/health", (_req, res) => res.json({ ok: true, time: new Date().toISOStr
 // ---------------------------------------------------------------------
 // Live stats — what the GitHub Pages dashboard shows
 // ---------------------------------------------------------------------
+// Cached briefly: this is an unfiltered count(*) across every shard's
+// entire businesses table (millions of rows each) and was previously
+// re-run from scratch on EVERY page load, by EVERY visitor, with zero
+// caching — a direct contributor to the page feeling slow. The real
+// numbers only move when scan_worker.py's 6-hour cron writes new rows,
+// so a 60-second-old real count is still a true, current answer.
+let statsCache = { data: null, fetchedAt: 0 };
+const STATS_CACHE_TTL_MS = 60 * 1000;
+
 app.get("/api/stats", async (_req, res) => {
   try {
+    if (statsCache.data && Date.now() - statsCache.fetchedAt < STATS_CACHE_TTL_MS) {
+      return res.json(statsCache.data);
+    }
+
     // One shard's count is meaningless on its own — sum every shard's
     // count for a real total, and take the latest last_seen_at across
     // all of them (a business synced into shard 2 ten minutes ago still
     // counts as "last updated" even if shard 1 hasn't been touched today).
-    const perShard = await queryEachShard(`
-      SELECT count(*)::int AS total,
-             count(*) FILTER (WHERE website IS NULL OR website = '')::int AS no_website,
-             max(last_seen_at) AS last_updated
-      FROM businesses
-    `);
+    const [perShard, categories] = await Promise.all([
+      queryEachShard(`
+        SELECT count(*)::int AS total,
+               count(*) FILTER (WHERE website IS NULL OR website = '')::int AS no_website,
+               max(last_seen_at) AS last_updated
+        FROM businesses
+      `),
+      getRealCategories(),
+    ]);
     let total = 0, no_website = 0, last_updated = null;
     for (const { rows: [row] } of perShard) {
       total += row.total || 0;
@@ -84,15 +100,16 @@ app.get("/api/stats", async (_req, res) => {
         last_updated = row.last_updated;
       }
     }
-    const categories = await getRealCategories();
 
-    res.json({
+    const data = {
       total_businesses: total,
       no_website_count: no_website,
       distinct_categories: categories.length,
       last_updated,
       shard_count: shards.length,
-    });
+    };
+    statsCache = { data, fetchedAt: Date.now() };
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
