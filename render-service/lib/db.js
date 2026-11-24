@@ -63,7 +63,41 @@ function parseConnectionUrl(url) {
     ssl: wantsSsl ? { rejectUnauthorized: true } : undefined,
     waitForConnections: true,
     connectionLimit: 10,
+    // TiDB Cloud's own docs: connections held open longer than ~30 minutes
+    // can be killed unexpectedly (server restarts/maintenance), and they
+    // recommend a max connection lifetime around 5 minutes. mysql2 has no
+    // direct "max lifetime" knob, so idleTimeout recycles pooled
+    // connections well under that window instead of letting one sit idle
+    // until it goes stale and the next query on it just fails outright.
+    idleTimeout: 240000, // 4 min — under TiDB's ~5 min recommendation
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 10000,
   };
+}
+
+// Transient connection errors (TiDB killed an idle/stale connection, a
+// maintenance restart, a brief network blip) show up as a thrown error from
+// pool.query() even though the pool itself is healthy — mysql2 doesn't
+// retry these automatically. Retrying once with a fresh connection from the
+// pool turns a real but harmless hiccup into a transparent success instead
+// of a 500 on whoever's loading the Find Companies page at that moment.
+const TRANSIENT_CODES = new Set([
+  "PROTOCOL_CONNECTION_LOST",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ECONNREFUSED",
+  "PROTOCOL_SEQUENCE_TIMEOUT",
+]);
+
+async function queryWithRetry(pool, sql, params) {
+  try {
+    const [rows] = await pool.query(sql, params);
+    return rows;
+  } catch (err) {
+    if (!TRANSIENT_CODES.has(err.code)) throw err;
+    const [rows] = await pool.query(sql, params);
+    return rows;
+  }
 }
 
 const shards = discoverShards().map(({ num, url }) => ({
@@ -78,8 +112,7 @@ async function query(sql, params = []) {
   // write path (lib/upsert.js) and anywhere a caller deliberately only
   // wants one specific shard, never for reads that should reflect the
   // whole dataset.
-  const [rows] = await activeShard.pool.query(sql, params);
-  return rows;
+  return queryWithRetry(activeShard.pool, sql, params);
 }
 
 async function queryEachShard(sql, params = []) {
@@ -90,7 +123,7 @@ async function queryEachShard(sql, params = []) {
   // than having rows silently flattened together.
   return Promise.all(
     shards.map(async (s) => {
-      const [rows] = await s.pool.query(sql, params);
+      const rows = await queryWithRetry(s.pool, sql, params);
       return { num: s.num, rows };
     })
   );
