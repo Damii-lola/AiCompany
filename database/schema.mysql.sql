@@ -104,7 +104,13 @@ create table if not exists businesses (
   status_id         smallint unsigned,
   lon               float,
   lat               float,
-  has_website       boolean as (website is not null and website <> '') stored,
+  -- VIRTUAL, not STORED: TiDB does not support adding a STORED generated
+  -- column via ALTER TABLE at all (only at CREATE TABLE time), which a
+  -- real live shard hit when widening `website` to TEXT required
+  -- dropping and re-adding this column. VIRTUAL has no such restriction,
+  -- is still indexable in TiDB, and the filter (has_website = 0) uses the
+  -- index either way — verified against real local data.
+  has_website       boolean as (website is not null and website <> '') virtual,
   first_seen_at     timestamp not null default current_timestamp,
   last_seen_at      timestamp not null default current_timestamp,
   constraint fk_businesses_category       foreign key (category_id)       references categories(id),
