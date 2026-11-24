@@ -13,7 +13,7 @@ feasibility study from an incumbent like MMCG.
 
 DATA SOURCE (changed Nov 2026): this used to query a local
 business_database.parquet file directly with DuckDB. That file doesn't
-exist anymore — the real data now lives in the live, sharded Prisma
+exist anymore — the real data now lives in the live, sharded TiDB
 Postgres setup (database/schema.sql, scanner-service/scan_worker.py,
 render-service), which already did the one-time US+territories backfill
 (~18.8M real rows across however many shard databases are configured).

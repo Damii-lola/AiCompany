@@ -24,7 +24,7 @@ First AI in the "Researchers" category (Company Scrapper, Basic Researcher,
 Advance Researcher, Organizer). Job: a user types a plain-English research
 request, this turns it into a real structured query against the live
 database (render-service's API, ~18.8M real US+territory businesses across
-however many Prisma shards are configured) and hands back real deliverable
+however many TiDB shards are configured) and hands back real deliverable
 files (CSV/XLSX/PDF) — the actual locked SBA V1 product.
 
 RUNS AS A GITHUB ACTIONS SYSTEM, NOT A KAGGLE GPU NOTEBOOK (changed Nov

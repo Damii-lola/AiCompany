@@ -10,43 +10,13 @@ const { geocodeAddress } = require("./lib/geocode");
 const { getFilterOptions } = require("./lib/filters");
 const { searchCompanies } = require("./lib/companies");
 const { upsertBusinesses } = require("./lib/upsert");
-
-// Shared by /api/trade-area and /api/research — both need the exact same
-// fan-out-across-shards-then-merge logic, so it lives in one place.
-// businesses_within_radius() now returns a real distance_miles column
-// (database/schema.sql) specifically so this can merge-sort every
-// shard's already-sorted results back into one correctly-ordered list,
-// instead of just concatenating shard 1's closest matches followed by
-// shard 2's closest matches.
-async function tradeAreaFanOut(lat, lon, radiusMiles, categories, noWebsiteOnly, country) {
-  const [businessRows, summaryRows] = await Promise.all([
-    queryEachShard(
-      "SELECT * FROM businesses_within_radius($1, $2, $3, $4, $5, $6)",
-      [lat, lon, radiusMiles, categories, !!noWebsiteOnly, country || null]
-    ),
-    queryEachShard(
-      "SELECT * FROM businesses_trade_area_summary($1, $2, $3, $4, $5)",
-      [lat, lon, radiusMiles, categories, country || null]
-    ),
-  ]);
-
-  const businesses = businessRows
-    .flatMap((s) => s.rows)
-    .sort((a, b) => a.distance_miles - b.distance_miles);
-
-  let competitor_count = 0, no_website_count = 0, nearest_miles = null;
-  for (const { rows } of summaryRows) {
-    const row = rows[0];
-    if (!row) continue;
-    competitor_count += Number(row.competitor_count) || 0;
-    no_website_count += Number(row.no_website_count) || 0;
-    if (row.nearest_miles != null && (nearest_miles === null || row.nearest_miles < nearest_miles)) {
-      nearest_miles = row.nearest_miles;
-    }
-  }
-
-  return { businesses, summary: { competitor_count, no_website_count, nearest_miles } };
-}
+// TiDB has no stored functions/procedures and no spatial types, so the
+// radius/"trade area" fan-out-across-shards-then-merge logic that used to
+// be two Postgres SQL functions (businesses_within_radius/
+// businesses_trade_area_summary) is now real application code — see
+// lib/trade-area.js for the bounding-box-prefilter + real-haversine-
+// distance implementation, shared by /api/trade-area and /api/research.
+const { tradeAreaFanOut } = require("./lib/trade-area");
 
 const app = express();
 app.use(express.json({ limit: "10mb" })); // ingest batches can be sizeable
@@ -85,17 +55,20 @@ app.get("/api/stats", async (_req, res) => {
     // counts as "last updated" even if shard 1 hasn't been touched today).
     const [perShard, categories] = await Promise.all([
       queryEachShard(`
-        SELECT count(*)::int AS total,
-               count(*) FILTER (WHERE website IS NULL OR website = '')::int AS no_website,
+        SELECT count(*) AS total,
+               SUM(CASE WHEN has_website = 0 THEN 1 ELSE 0 END) AS no_website,
                max(last_seen_at) AS last_updated
         FROM businesses
       `),
+      // MySQL/TiDB has no FILTER clause (Postgres-only) — the has_website
+      // generated+indexed column (database/schema.mysql.sql) plus a plain
+      // SUM(CASE WHEN ...) is the direct equivalent, and it's indexed too.
       getRealCategories(),
     ]);
     let total = 0, no_website = 0, last_updated = null;
     for (const { rows: [row] } of perShard) {
-      total += row.total || 0;
-      no_website += row.no_website || 0;
+      total += Number(row.total) || 0;
+      no_website += Number(row.no_website) || 0;
       if (row.last_updated && (!last_updated || row.last_updated > last_updated)) {
         last_updated = row.last_updated;
       }
@@ -175,22 +148,22 @@ app.get("/api/businesses", async (req, res) => {
     const params = [];
     if (category) {
       params.push(String(category).split(","));
-      where.push(`category = ANY($${params.length})`);
+      where.push(`category IN (?)`); // mysql2 expands an array param into a real IN-list
     }
     if (country) {
       params.push(country);
-      where.push(`country = $${params.length}`);
+      where.push(`country = ?`);
     }
     if (region) {
       params.push(region);
-      where.push(`region = $${params.length}`);
+      where.push(`region = ?`);
     }
     if (city) {
       params.push(city);
-      where.push(`city = $${params.length}`);
+      where.push(`city = ?`);
     }
     if (no_website === "true") {
-      where.push(`(website IS NULL OR website = '')`);
+      where.push(`has_website = 0`);
     }
     // Ask each shard for up to the full limit (not limit/N) — a business
     // list has no meaningful cross-shard order to begin with, and asking
@@ -198,10 +171,9 @@ app.get("/api/businesses", async (req, res) => {
     // `limit` total even when enough real rows exist, just unevenly
     // spread across shards. Trim to the real limit after merging instead.
     const capped = Math.min(parseInt(limit, 10) || 100, 1000);
-    params.push(capped);
     const sql = `SELECT * FROM businesses_readable
                  ${where.length ? "WHERE " + where.join(" AND ") : ""}
-                 LIMIT $${params.length}`;
+                 LIMIT ${capped}`;
     const rows = (await queryAll(sql, params)).slice(0, capped);
     res.json({ count: rows.length, businesses: rows });
   } catch (e) {

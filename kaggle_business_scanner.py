@@ -84,7 +84,7 @@ def push_single_file(local_path, slug, title, note):
     os.link(local_path, link)
     return push_dataset(up, slug, title, note)
 
-# %% Real-time ingest into Prisma Postgres, via the Render service — the "constantly
+# %% Real-time ingest into TiDB Cloud, via the Render service — the "constantly
 # updating itself" step. Database credentials never touch this notebook at
 # all (only Render holds them, per the architecture decision); this script
 # only ever knows a shared secret and the Render URL, both Kaggle Secrets.

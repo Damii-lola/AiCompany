@@ -2,7 +2,7 @@
   "name": "company-scrapper-service",
   "version": "1.0.0",
   "private": true,
-  "description": "Always-on API for the Researchers/Company Scrapper AI — reads/writes the live Prisma Postgres business store and exposes an Apollo-style filtered/paginated company browser (GET /api/filters, GET /api/companies) plus radius trade-area search (/api/trade-area, /api/research). Real geocoding + real fuzzy category matching + the actual database queries are always deterministic; no LLM call anywhere in this service.",
+  "description": "Always-on API for the Researchers/Company Scrapper AI — reads/writes the live TiDB Cloud Starter business store and exposes an Apollo-style filtered/paginated company browser (GET /api/filters, GET /api/companies) plus radius trade-area search (/api/trade-area, /api/research). Real geocoding + real fuzzy category matching + the actual database queries are always deterministic; no LLM call anywhere in this service.",
   "type": "commonjs",
   "main": "server.js",
   "engines": {
@@ -12,9 +12,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "pg": "^8.13.1",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.1"
+    "express": "^4.21.1",
+    "mysql2": "^3.24.6"
   }
 }

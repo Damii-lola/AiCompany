@@ -5,19 +5,29 @@ Replaces the old Kaggle-notebook scanner for this job specifically. This
 was NEVER GPU work — DuckDB reading Overture Maps' S3 parquet is CPU/
 memory/network bound, nothing here ever touched a GPU.
 
-STORE: Prisma Postgres (direct psycopg2 connection — Prisma Postgres has
-no REST API like Supabase did, so this talks straight Postgres). Schema
-lives in database/schema.sql: a normalized schema (category/location/
-brand/status stored as small integer foreign keys into lookup tables
-instead of repeated text) built specifically to fit inside Prisma's free
-tier at real scan volume.
+STORE: TiDB Cloud Starter (direct PyMySQL connection — TiDB speaks the
+MySQL wire protocol, not Postgres). Moved off Prisma Postgres entirely:
+Prisma's 2GB/workspace free-tier cap was already being exceeded by the
+live data, and scaling it further meant more separate email sign-ups,
+which ran out. TiDB Cloud Starter gives up to 5 free instances PER
+ACCOUNT (no card needed), 5GiB storage + 50M request units/month each —
+25GB total under one login, no extra emails needed. Schema lives in
+database/schema.mysql.sql: same normalized design as before (category/
+location/brand/status stored as small integer foreign keys into lookup
+tables instead of repeated text), rewritten to MySQL/TiDB dialect — see
+that file's header for exactly what changed and why (no stored
+functions/procedures or spatial types on TiDB, so the old
+businesses_within_radius/businesses_trade_area_summary Postgres functions
+don't exist here anymore; render-service/lib/trade-area.js does that math
+in application code instead).
 
-SHARDING: a single free Prisma Postgres database caps out at 2GB storage
-and 200k operations/month, which the US+territories backfill blows
-through before finishing one pass. Instead of paying for a bigger plan,
-this worker splits the work across as many free Prisma databases as you
-give it — set DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... (any
-number of them) as secrets and this worker:
+SHARDING: a single free TiDB Cloud Starter instance caps out at 5GiB
+storage and 50M request units/month, which the US+territories backfill
+can still exceed before finishing one pass depending on how many
+instances are configured. This worker splits the work across as many free
+TiDB instances as you give it — set DATABASE_URL_1, DATABASE_URL_2,
+DATABASE_URL_3, ... (any number of them, up to the 5 a single TiDB Cloud
+account gives you for free) as secrets and this worker:
   1. splits the FULL tile list evenly across however many shards you
      configured (round-robin by tile index, not a contiguous block —
      see assign_tiles_to_shards below for why),
@@ -25,7 +35,7 @@ number of them) as secrets and this worker:
      each with its own DuckDB connection and its own Postgres connection
      — all N databases are being written to at the same time, not one
      after another.
-Each shard is a fully normal, independent copy of database/schema.sql —
+Each shard is a fully normal, independent copy of database/schema.mysql.sql —
 apply the schema to EVERY shard database before adding its
 DATABASE_URL_N secret. Lookup-table ids (category/location/brand/status)
 are NOT consistent across shards, but that's fine: every join always
@@ -90,10 +100,12 @@ import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from urllib.parse import urlparse, unquote, parse_qs
+
 import duckdb
 import requests
-import psycopg2
-import psycopg2.extras
+import pymysql
+import pymysql.cursors
 
 # Render/Actions' log stream isn't a real terminal, so Python block-buffers
 # stdout by default instead of flushing per-line. Force line buffering so
@@ -132,7 +144,15 @@ US_REGIONS = [
 
 
 def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
+    # Despite the name (kept for a minimal diff against every call site),
+    # this now returns a real Python datetime, not an ISO string. A
+    # Postgres TIMESTAMPTZ column happily parsed the old ISO-with-"+00:00"
+    # string, but MySQL/TiDB's TIMESTAMP columns expect 'YYYY-MM-DD
+    # HH:MM:SS' — PyMySQL serializes a real datetime object to that format
+    # correctly regardless of tzinfo (it just prints the already-UTC field
+    # values), so passing the object itself sidesteps the format mismatch
+    # entirely rather than hand-formatting a string.
+    return datetime.now(timezone.utc)
 
 
 def discover_shards():
@@ -160,9 +180,41 @@ def discover_shards():
     return shards
 
 
+def _parse_connection_url(url):
+    """TiDB Cloud connection strings look like mysql://user:pass@host:4000/db
+    (optionally with a trailing ?ssl=false for a local, SSL-less MySQL/
+    MariaDB test instance — see database/schema.mysql.sql's header). PyMySQL
+    takes host/port/user/password/database as separate kwargs rather than a
+    single URL, so this parses it apart the same way
+    render-service/lib/db.js's parseConnectionUrl does on the Node side."""
+    u = urlparse(url)
+    qs = parse_qs(u.query)
+    wants_ssl = (qs.get("ssl", ["true"])[0]) != "false"
+    return {
+        "host": u.hostname,
+        "port": u.port or 4000,  # TiDB Cloud's default port
+        "user": unquote(u.username or ""),
+        "password": unquote(u.password or ""),
+        "database": u.path.lstrip("/"),
+        # TiDB Cloud's gateway uses a publicly-trusted cert, so an empty
+        # dict (PyMySQL's "use TLS, verify against the system CA bundle")
+        # is the right default — no custom CA bundle needed, unlike the old
+        # Prisma Postgres setup which needed rejectUnauthorized:false for
+        # its internal routing cert.
+        "ssl": {} if wants_ssl else None,
+        "charset": "utf8mb4",
+        "cursorclass": pymysql.cursors.Cursor,
+    }
+
+
+# NOTE: every `pg`-prefixed name below (pg_connect, pg_upsert_businesses,
+# the `pg` variable) is a holdover name from the Postgres/Prisma era — left
+# as-is to keep this diff focused on the actual driver/SQL dialect change
+# rather than a cosmetic rename. All of them are real TiDB/PyMySQL
+# connections now, not Postgres.
 def pg_connect(url):
-    con = psycopg2.connect(url)
-    con.autocommit = True
+    con = pymysql.connect(**_parse_connection_url(url))
+    con.autocommit(True)
     return con
 
 
@@ -193,7 +245,7 @@ class Lookups:
     def _ensure_simple(self, table, col, cache, values):
         """Bulk-inserts any values not already cached, in ONE statement,
         then merges the new ids back into the cache. values may contain
-        None/''/duplicates — all filtered before hitting Postgres."""
+        None/''/duplicates — all filtered before hitting the database."""
         # isinstance check, not just truthiness: a stray float (NaN or
         # otherwise) landing in this set alongside real strings is exactly
         # what makes sorted({...}) raise "'<' not supported between
@@ -203,12 +255,14 @@ class Lookups:
         if not new_values:
             return
         with self.pg.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                f"INSERT INTO {table} ({col}) VALUES %s ON CONFLICT ({col}) DO NOTHING",
-                [(v,) for v in new_values],
-            )
-            cur.execute(f"SELECT {col}, id FROM {table} WHERE {col} = ANY(%s)", (new_values,))
+            # INSERT IGNORE skips rows that would violate the unique(col)
+            # constraint instead of erroring — the MySQL/TiDB equivalent of
+            # Postgres's ON CONFLICT DO NOTHING. executemany with a single
+            # VALUES (%s) tuple is PyMySQL's bulk-insert form (it rewrites
+            # this into one real multi-row INSERT, same as
+            # psycopg2.extras.execute_values did).
+            cur.executemany(f"INSERT IGNORE INTO {table} ({col}) VALUES (%s)", [(v,) for v in new_values])
+            cur.execute(f"SELECT {col}, id FROM {table} WHERE {col} IN %s", (tuple(new_values),))
             cache.update(cur.fetchall())
 
     def ensure_categories(self, values):
@@ -232,31 +286,27 @@ class Lookups:
         if not new_triples:
             return
         with self.pg.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                "INSERT INTO locations (city, region, country) VALUES %s "
-                "ON CONFLICT (city, region, country) DO NOTHING",
+            cur.executemany(
+                "INSERT IGNORE INTO locations (city, region, country) VALUES (%s, %s, %s)",
                 new_triples,
             )
-            # Row-comparison against an array of tuples isn't something
-            # psycopg2/Postgres do directly ("= ANY(%s)" fails with a
-            # DatatypeMismatch for composite values) — zip the three
-            # columns back into rows with unnest() and join on that instead.
-            cities = [t[0] for t in new_triples]
-            regions = [t[1] for t in new_triples]
-            countries = [t[2] for t in new_triples]
+            # MySQL/TiDB has no clean row-value IN-list (the unnest()-joined
+            # exact-triple match Postgres used) — fetch every row matching
+            # ANY of the three columns independently (a superset; locations
+            # is a small table, so over-fetching here is cheap) and filter
+            # down to exact triple matches in Python instead of in SQL.
+            cities = tuple({t[0] for t in new_triples})
+            regions = tuple({t[1] for t in new_triples})
+            countries = tuple({t[2] for t in new_triples})
             cur.execute(
-                """
-                SELECT l.city, l.region, l.country, l.id
-                FROM locations l
-                JOIN (
-                    SELECT unnest(%s::text[]) AS city, unnest(%s::text[]) AS region, unnest(%s::text[]) AS country
-                ) t ON l.city = t.city AND l.region = t.region AND l.country = t.country
-                """,
+                "SELECT city, region, country, id FROM locations "
+                "WHERE city IN %s AND region IN %s AND country IN %s",
                 (cities, regions, countries),
             )
+            wanted = set(new_triples)
             for (c, r, k, i) in cur.fetchall():
-                self.locations[(c, r, k)] = i
+                if (c, r, k) in wanted:
+                    self.locations[(c, r, k)] = i
 
 
 def pg_upsert_businesses(pg, lookups, records):
@@ -306,26 +356,29 @@ def pg_upsert_businesses(pg, lookups, records):
     with pg.cursor() as cur:
         for i in range(0, len(rows), INGEST_BATCH_SIZE):
             batch = rows[i:i + INGEST_BATCH_SIZE]
-            # ON CONFLICT only bumps last_seen_at, nothing else — a business
-            # already in the table is left alone (its name/category/address/
-            # etc. never get silently overwritten by a later re-scan). That's
-            # by design: this scanner's job is "find it and add it once,"
-            # not "keep re-verifying it." Real-world changes to an existing
-            # business (ownership transfer, closed down, moved) are a job
-            # for a separate targeted updater to build later — one that
-            # checks specific businesses on purpose, not a side effect of
-            # re-walking the same tiles. last_seen_at is still bumped on
-            # every re-sighting specifically so that future updater has a
-            # real "not re-confirmed since X" signal to work from — if this
-            # went to DO NOTHING entirely, last_seen_at would always equal
-            # first_seen_at and that signal would be lost.
-            psycopg2.extras.execute_values(cur, """
+            # ON DUPLICATE KEY UPDATE only bumps last_seen_at, nothing else
+            # — a business already in the table is left alone (its name/
+            # category/address/etc. never get silently overwritten by a
+            # later re-scan). That's by design: this scanner's job is "find
+            # it and add it once," not "keep re-verifying it." Real-world
+            # changes to an existing business (ownership transfer, closed
+            # down, moved) are a job for a separate targeted updater to
+            # build later — one that checks specific businesses on purpose,
+            # not a side effect of re-walking the same tiles. last_seen_at
+            # is still bumped on every re-sighting specifically so that
+            # future updater has a real "not re-confirmed since X" signal to
+            # work from — if this went to a true no-op entirely,
+            # last_seen_at would always equal first_seen_at and that signal
+            # would be lost. PyMySQL's executemany rewrites a single
+            # VALUES (...) statement into one real multi-row INSERT, the
+            # same batching psycopg2.extras.execute_values gave on Postgres.
+            cur.executemany("""
                 INSERT INTO businesses (
                     id, name, category_id, category_extra_id, address, location_id,
                     postcode, phone, website, email, social, brand_id, confidence,
                     status_id, lon, lat, last_seen_at
-                ) VALUES %s
-                ON CONFLICT (id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)
             """, batch)
 
 
@@ -336,8 +389,11 @@ def load_done_tiles(pg, release):
     set, never another shard's — tile-to-shard assignment is static for a
     pass (see assign_tiles_to_shards), so a tile this shard hasn't scanned
     yet was never going to be in another shard's scan_tiles either."""
+    # `release` is a reserved word in MySQL/TiDB (used by RELEASE SAVEPOINT)
+    # — backtick-quoted here and in database/schema.mysql.sql, same as the
+    # scan_tiles table's own column definition.
     with pg.cursor() as cur:
-        cur.execute("SELECT tile_key FROM scan_tiles WHERE release = %s", (release,))
+        cur.execute("SELECT tile_key FROM scan_tiles WHERE `release` = %s", (release,))
         return {row[0] for row in cur.fetchall()}
 
 
@@ -347,10 +403,10 @@ def flush_done_tiles(pg, pending):
     if not pending:
         return
     with pg.cursor() as cur:
-        psycopg2.extras.execute_values(cur, """
-            INSERT INTO scan_tiles (tile_key, release, rows_found, scanned_at) VALUES %s
-            ON CONFLICT (tile_key) DO UPDATE SET
-                rows_found = excluded.rows_found, scanned_at = excluded.scanned_at
+        cur.executemany("""
+            INSERT INTO scan_tiles (tile_key, `release`, rows_found, scanned_at) VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                rows_found = VALUES(rows_found), scanned_at = VALUES(scanned_at)
         """, [(k, r, n, _now_iso()) for (k, r, n) in pending])
     pending.clear()
 

@@ -8,19 +8,22 @@ name: Company Scrapper scan
 # shard database's own scan_tiles table, not in this job's own disk,
 # which gets thrown away the moment it ends either way.
 #
-# SHARDING: one free Prisma Postgres database caps out well before a full
-# US+territories backfill finishes (2GB storage / 200k ops per month), so
-# the work is split across as many free Prisma databases as you add here
-# as DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... secrets —
+# SHARDING: moved off Prisma Postgres to TiDB Cloud Starter — Prisma's
+# 2GB/workspace free-tier cap was already being exceeded by the live data,
+# and scaling it further meant more separate email sign-ups, which ran
+# out. TiDB Cloud Starter gives up to 5 free instances PER ACCOUNT (no
+# card needed), 5GiB storage + 50M request units/month each. The work is
+# split across as many free TiDB instances as you add here as
+# DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... secrets —
 # scan_worker.py discovers whichever numbered ones exist and scans all of
 # them AT THE SAME TIME (one thread per shard). Add every DATABASE_URL_N
 # secret you want BELOW in the env block (GitHub Actions doesn't support
 # wildcard secret passthrough, so each numbered one needs its own line
 # here) before the shard count you want is live, and apply
-# database/schema.sql to each new shard database by hand before wiring up
-# its secret, same one-time manual step as before. Leave the shard count
-# alone until a full pass finishes — see scan_worker.py's module
-# docstring for why.
+# database/schema.mysql.sql to each new shard database by hand before
+# wiring up its secret, same one-time manual step as before. Leave the
+# shard count alone until a full pass finishes — see scan_worker.py's
+# module docstring for why.
 #
 # This repo is public, so these minutes are free and unlimited — no
 # billing setup needed anywhere for this, which is the whole reason this

@@ -1,5 +1,16 @@
 -- Company Scrapper — Prisma Postgres schema (replaces supabase/schema.sql)
 -- =====================================================================
+-- DEPRECATED — kept for historical reference only. This is NOT the live
+-- schema anymore. Prisma Postgres's 2GB/workspace free-tier cap was
+-- exceeded by the live data, and there weren't enough separate emails to
+-- keep splitting across more Prisma accounts. The project moved to TiDB
+-- Cloud Starter (up to 5 free instances PER ACCOUNT, 25GB total under one
+-- login — solves the email-scarcity problem directly). The live schema is
+-- database/schema.mysql.sql (MySQL/TiDB dialect) — see its header for the
+-- full list of what changed and why (radius/"trade area" search moved out
+-- of SQL entirely into render-service/lib/trade-area.js, since TiDB has
+-- neither the cube/earthdistance extensions nor stored functions).
+-- =====================================================================
 -- Run this ONCE against your Prisma Postgres database (psql "$DATABASE_URL"
 -- -f database/schema.sql, or paste into Prisma's SQL console) before the
 -- Render service or the scanner ever try to write to it.

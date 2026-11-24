@@ -1,18 +1,23 @@
 "use strict";
-// Prisma Postgres — now SHARDED. One free Prisma database caps out
-// (2GB storage / 200k ops a month) well before a full US+territories
-// backfill finishes, so the scanner (scan_worker.py) splits its writes
-// across as many free databases as you give it, via DATABASE_URL_1,
-// DATABASE_URL_2, DATABASE_URL_3, ... secrets. This service is the READ
-// side, so it has to fan every read out across ALL of those same shards
-// and merge the results in application code — externally it still looks
-// like one unified database, nothing about the API's shape changes.
+// TiDB Cloud Starter — SHARDED. Moved off Prisma Postgres entirely: Prisma's
+// 2GB/workspace free-tier cap was already being exceeded by the live data
+// (one shard alone showed 3.4GB used), and getting more Prisma shards means
+// more separate email sign-ups, which ran out. TiDB Cloud Starter gives up
+// to 5 free instances PER ACCOUNT (no card needed), 5GiB storage + 50M
+// request units/month EACH — 25GB total under one login, no extra emails.
 //
-// Discovery uses the exact same DATABASE_URL_<N> convention as
-// scanner-service/scan_worker.py (keep them in sync if you ever change
-// one). A bare DATABASE_URL (no numeric suffix) still works as a single
-// implicit shard — nothing here requires more than one database.
-const { Pool } = require("pg");
+// TiDB speaks the MySQL wire protocol, not Postgres — this file (and every
+// other lib/*.js + server.js) was rewritten from `pg` to `mysql2` for that
+// reason. See database/schema.mysql.sql for the schema-level changes this
+// forced (no stored functions, no spatial types, no cube/earthdistance —
+// radius search moved to lib/trade-area.js as real application code).
+//
+// Discovery uses the exact same DATABASE_URL_<N> convention as before and
+// as scanner-service/scan_worker.py (keep them in sync if you ever change
+// one) — just now each one is a TiDB connection string
+// (mysql://user:pass@host:4000/dbname) instead of a Postgres one. A bare
+// DATABASE_URL (no numeric suffix) still works as a single implicit shard.
+const mysql = require("mysql2/promise");
 
 function discoverShards() {
   const shards = [];
@@ -29,9 +34,8 @@ function discoverShards() {
         "No database configured — set DATABASE_URL_1 (and DATABASE_URL_2, " +
         "DATABASE_URL_3, ... for more shards) as Render environment variables, " +
         "or a bare DATABASE_URL for a single-database setup. Each one is a " +
-        "Prisma Postgres connection string from your Prisma dashboard " +
-        "(Connect -> the postgres://...@db.prisma.io:5432/postgres?sslmode=require " +
-        "string, or the pooled.db.prisma.io variant)."
+        "TiDB Cloud connection string from your TiDB Cloud dashboard's " +
+        "'Connect' panel (mysql://USER:PASSWORD@HOST:4000/DBNAME)."
       );
     }
     shards.push({ num: 1, url: bare });
@@ -39,19 +43,34 @@ function discoverShards() {
   return shards;
 }
 
+// TiDB Cloud requires TLS, and its gateway uses a publicly-trusted cert
+// (unlike Prisma Postgres, which needed rejectUnauthorized:false for its
+// internal routing cert) — rejectUnauthorized:true is the correct, safer
+// default here. mysql2's own URI parser doesn't accept an `ssl` object via
+// query string, so the connection string is parsed into a real config
+// object instead of string-concatenating options onto it. A local, SSL-less
+// MySQL/MariaDB (used for local testing — see database/schema.mysql.sql's
+// header) has no `?ssl=` param at all, so ssl stays undefined for it.
+function parseConnectionUrl(url) {
+  const u = new URL(url);
+  const wantsSsl = (u.searchParams.get("ssl") ?? "true") !== "false";
+  return {
+    host: u.hostname,
+    port: u.port ? parseInt(u.port, 10) : 4000, // TiDB Cloud's default port
+    user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password),
+    database: u.pathname.replace(/^\//, ""),
+    ssl: wantsSsl ? { rejectUnauthorized: true } : undefined,
+    waitForConnections: true,
+    connectionLimit: 10,
+  };
+}
+
 const shards = discoverShards().map(({ num, url }) => ({
   num,
-  pool: new Pool({ connectionString: url, ssl: { rejectUnauthorized: false } }),
+  pool: mysql.createPool(parseConnectionUrl(url)),
 }));
 
-// The Kaggle-fallback ingest endpoint (lib/upsert.js) is the only writer
-// in this service, and — same rule as the scanner — new writes always go
-// to the single highest-numbered configured shard, never spread across
-// shards by this service. (The scanner itself uses a different rule,
-// static tile partitioning, because it's doing a one-time bulk backfill
-// across a known tile list; this endpoint takes arbitrary ad-hoc rows
-// with no tile to partition by, so "always the newest shard" is the
-// simple, correct choice here.)
 const activeShard = shards[shards.length - 1];
 
 async function query(sql, params = []) {
@@ -59,7 +78,7 @@ async function query(sql, params = []) {
   // write path (lib/upsert.js) and anywhere a caller deliberately only
   // wants one specific shard, never for reads that should reflect the
   // whole dataset.
-  const { rows } = await activeShard.pool.query(sql, params);
+  const [rows] = await activeShard.pool.query(sql, params);
   return rows;
 }
 
@@ -70,7 +89,10 @@ async function queryEachShard(sql, params = []) {
   // by a real column like distance_miles — can do that themselves rather
   // than having rows silently flattened together.
   return Promise.all(
-    shards.map(async (s) => ({ num: s.num, rows: (await s.pool.query(sql, params)).rows }))
+    shards.map(async (s) => {
+      const [rows] = await s.pool.query(sql, params);
+      return { num: s.num, rows };
+    })
   );
 }
 

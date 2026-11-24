@@ -76,28 +76,38 @@ function buildWhere({ categories, countries, regions, city, noWebsiteOnly, statu
   const clauses = [];
   const params = [];
 
+  // mysql2 expands a single `?` bound to an array into a parenthesized,
+  // comma-separated, correctly-escaped list — `IN (?)` with an array param
+  // is the direct MySQL/TiDB equivalent of Postgres's `= ANY($1::text[])`.
   if (categories && categories.length) {
     params.push(categories);
-    clauses.push(`category = ANY($${params.length}::text[])`);
+    clauses.push(`category IN (?)`);
   }
   if (countries && countries.length) {
     params.push(countries);
-    clauses.push(`country = ANY($${params.length}::text[])`);
+    clauses.push(`country IN (?)`);
   }
   if (regions && regions.length) {
     params.push(regions);
-    clauses.push(`region = ANY($${params.length}::text[])`);
+    clauses.push(`region IN (?)`);
   }
   if (city && city.trim()) {
+    // MySQL/TiDB's default collation (utf8mb4_general_ci / _0900_ai_ci) is
+    // already case-insensitive, so plain LIKE is ILIKE's direct equivalent
+    // here — no separate case-insensitive operator needed.
     params.push(`%${city.trim()}%`);
-    clauses.push(`city ILIKE $${params.length}`);
+    clauses.push(`city LIKE ?`);
   }
   if (noWebsiteOnly) {
-    clauses.push(`(website IS NULL OR trim(website) = '')`);
+    // has_website is the generated+indexed column added in
+    // database/schema.mysql.sql specifically so this filter (previously an
+    // un-indexable `WHERE website IS NULL OR trim(website) = ''`) can use
+    // a real index instead of a full scan.
+    clauses.push(`has_website = 0`);
   }
   if (statuses && statuses.length) {
     params.push(statuses);
-    clauses.push(`operating_status = ANY($${params.length}::text[])`);
+    clauses.push(`operating_status IN (?)`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
@@ -129,18 +139,25 @@ async function searchCompanies(filters, page) {
   const limitPerShard = offset + PAGE_SIZE;
 
   const [countRows, dataRows] = await Promise.all([
-    queryEachShard(`SELECT count(*)::int AS cnt FROM businesses_readable ${where}`, params),
+    queryEachShard(`SELECT count(*) AS cnt FROM businesses_readable ${where}`, params),
     queryEachShard(
+      // MySQL/TiDB has no NULLS LAST modifier; `(name IS NULL)` evaluates to
+      // 0 for a real name and 1 for a null one, so ordering by that first
+      // puts every null-name row after every real one — the same effect
+      // Postgres's `ORDER BY name ASC NULLS LAST` had.
       `SELECT id, name, category, address, city, region, country, phone, website, operating_status
        FROM businesses_readable ${where}
-       ORDER BY name ASC NULLS LAST
+       ORDER BY (name IS NULL), name ASC
        LIMIT ${limitPerShard}`,
       params
     ),
   ]);
 
   let total = 0;
-  for (const { rows: [row] } of countRows) total += (row && row.cnt) || 0;
+  // mysql2 can return COUNT(*) as a JS BigInt/string depending on the
+  // column's exact type — Number(...) normalizes either back to a plain
+  // number before summing across shards.
+  for (const { rows: [row] } of countRows) total += (row && Number(row.cnt)) || 0;
 
   const merged = dataRows
     .flatMap((s) => s.rows)
