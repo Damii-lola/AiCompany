@@ -94,7 +94,13 @@ create table if not exists businesses (
   -- ceiling entirely rather than guessing a bigger number.
   address           text,
   location_id       int unsigned,
-  postcode          varchar(20),
+  -- postcode was assumed short (varchar(20)) matching the original
+  -- Postgres schema's comment ("already short, 5-10 bytes") — real
+  -- Overture data hit DataError 1406 against that cap too (some
+  -- postcode values are longer/combined). Never filtered, sorted, or
+  -- indexed anywhere (grepped render-service to confirm), so widened to
+  -- TEXT like the other free-text columns rather than guessing a new cap.
+  postcode          text,
   phone             text,
   website           text,
   email             text,
