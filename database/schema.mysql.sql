@@ -84,13 +84,21 @@ create table if not exists businesses (
   name              varchar(255),
   category_id       smallint unsigned,
   category_extra_id smallint unsigned,
-  address           varchar(500),
+  -- address/phone/website/email/social are never filtered, sorted, or
+  -- joined on directly (only the generated+indexed has_website column
+  -- below is) — so, matching the original Postgres schema's unbounded
+  -- `text` for these, they're `text` here too, not a guessed varchar(n).
+  -- A prior varchar(500) cap on website caused real DataError 1406s
+  -- ("Data too long") against real Overture data (long tracking-
+  -- parameter URLs genuinely exceed 500 chars) — this removes that
+  -- ceiling entirely rather than guessing a bigger number.
+  address           text,
   location_id       int unsigned,
   postcode          varchar(20),
-  phone             varchar(50),
-  website           varchar(500),
-  email             varchar(255),
-  social            varchar(500),
+  phone             text,
+  website           text,
+  email             text,
+  social            text,
   brand_id          int unsigned,
   confidence        float,
   status_id         smallint unsigned,
