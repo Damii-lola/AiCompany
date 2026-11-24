@@ -650,6 +650,14 @@ def main():
 
     shards = discover_shards()
     shard_nums = ", ".join(str(n) for n, _ in shards)
+    # TEMPORARY DEBUG — prints which database name each shard actually
+    # resolves to (host + database only, NEVER user/password) so a
+    # misconfigured secret (e.g. still pointing at /sys) shows up directly
+    # in the run's log instead of being guessed at. Remove once shard
+    # config is confirmed correct across all shards.
+    for n, url in shards:
+        cfg = _parse_connection_url(url)
+        print(f"[debug] shard {n} resolves to host={cfg['host']} database={cfg['database']!r}")
     print("Company Scrapper scan worker starting — US + SBA territories only, "
           f"no GPU required, no local disk state kept. {len(shards)} shard database(s) configured "
           f"(shard numbers: {shard_nums})."
