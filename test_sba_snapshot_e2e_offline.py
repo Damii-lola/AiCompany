@@ -79,6 +79,31 @@ def main():
                 "country": "US", "output_formats": ["csv", "xlsx", "pdf"],
             }
             files = sba.fulfil(spec, out_dir)
+            manifest_str_category = json.load(open(os.path.join(out_dir, "manifest.json")))
+            assert manifest_str_category["competitive_classification"]["direct"] >= 1
+            print("PASS: fulfil() works with spec['category'] as a plain string "
+                  "(the address/plain-English call form)")
+
+            # The OTHER real, documented call form (company_scrapper_ai.py's
+            # research(), center_lat/center_lon + a LIST of real matched
+            # category strings, ranked best-first) — classify_businesses()
+            # must not choke on spec["category"] being a list here. This is
+            # exactly the bug class worth a real regression test for.
+            out_dir2 = out_dir + "_listcat"
+            if os.path.isdir(out_dir2):
+                shutil.rmtree(out_dir2)
+            spec_list_cat = {
+                "center_lat": 39.9612, "center_lon": -82.9988,
+                "category": ["dental clinic", "orthodontist"], "radius_miles": 5,
+                "country": "US", "output_formats": ["csv"],
+            }
+            files2 = sba.fulfil(spec_list_cat, out_dir2)
+            manifest2 = json.load(open(os.path.join(out_dir2, "manifest.json")))
+            assert manifest2["competitive_classification"]["direct"] >= 1
+            print("PASS: fulfil() works with spec['category'] as a LIST (the "
+                  "center_lat/center_lon call form company_scrapper_ai.py actually "
+                  "uses) — classify_businesses correctly uses the first/primary match")
+            shutil.rmtree(out_dir2, ignore_errors=True)
             assert len(files) == 4, files  # csv, xlsx, pdf, manifest.json
             for f in files:
                 assert os.path.getsize(f) > 0, f"{f} is empty"

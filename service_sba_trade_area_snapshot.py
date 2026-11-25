@@ -249,7 +249,17 @@ def fulfil(spec: dict, out_dir: str) -> list:
         # service_competitive_classifier.py's module docstring for why
         # this is a rule-based tier and not the trained worker-AI
         # adapter the project reserves true subjective judgment calls for.
-        classified_records = classify_businesses(spec.get("category", ""), registry_records)
+        # spec["category"] is a str for the address/plain-English form,
+        # but a LIST for the center_lat/center_lon form (company_scrapper_
+        # ai.py's match_categories() legitimately returns several real,
+        # ranked-best-first category matches — e.g. ["dental_clinic",
+        # "orthodontist"]) — classify_businesses() needs one string, so
+        # the best (first/primary) match is what "the category the
+        # customer searched for" means here, same ranking rule
+        # match_categories() itself already documents.
+        spec_category = spec.get("category", "")
+        target_category = spec_category[0] if isinstance(spec_category, list) and spec_category else spec_category
+        classified_records = classify_businesses(target_category, registry_records)
         classification_df = pd.json_normalize(
             [r["competitive_classification"] for r in classified_records], sep="_")
         classification_df.columns = [f"classification_{c}" for c in classification_df.columns]
