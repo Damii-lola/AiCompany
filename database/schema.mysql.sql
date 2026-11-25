@@ -110,6 +110,11 @@ create table if not exists businesses (
   status_id         smallint unsigned,
   lon               float,
   lat               float,
+  -- Which discovery source first added this row — 'overture' (default,
+  -- the original backfill), 'osm' (OpenStreetMap Overpass, new), or
+  -- 'google_maps' (the self-hosted scraper, future). Doubles as the raw
+  -- "Data source" field the SBA report spec's section 12 asks for.
+  source            varchar(32) not null default 'overture',
   -- VIRTUAL, not STORED: TiDB does not support adding a STORED generated
   -- column via ALTER TABLE at all (only at CREATE TABLE time), which a
   -- real live shard hit when widening `website` to TEXT required
@@ -155,6 +160,7 @@ create or replace view businesses_readable as
     s.name as operating_status,
     b.lon, b.lat,
     b.has_website,
+    b.source,
     b.first_seen_at, b.last_seen_at
   from businesses b
   left join categories c1 on c1.id = b.category_id

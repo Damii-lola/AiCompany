@@ -1,0 +1,63 @@
+name: Company Scrapper OSM scan
+
+# A SECOND, independent discovery source alongside scan.yml (Overture) —
+# same TiDB shards, same businesses table, tagged source='osm' so rows
+# from each dataset are never confused (see database/schema.mysql.sql's
+# businesses.source column and scanner-service/osm_scan.py's docstring
+# for the full reasoning on why both run rather than one replacing the
+# other).
+#
+# Runs on its own, offset schedule from scan.yml's (different cron
+# minute/hour) so the two never hit shared TiDB connection limits or
+# compete for the runner at the same moment, even though they write to
+# different id-namespaces (osm_* vs Overture's GERS ids) so they could
+# never corrupt each other's rows either way.
+#
+# OVERPASS IS A SHARED PUBLIC RESOURCE, not a paid API with a contracted
+# rate limit — osm_scan.py already queries serially with a deliberate
+# pause between requests (see OSM_SLEEP_BETWEEN_QUERIES). Do not add
+# concurrency here or lower that pause without good reason; being a bad
+# citizen on Overpass risks it rate-limiting or blocking this whole
+# project's IP range.
+#
+# NOT YET TESTED AGAINST THE LIVE OVERPASS API (this sandbox's network
+# can't reach overpass-api.de) — test with workflow_dispatch on a small
+# manual run before trusting the schedule below with it. See
+# osm_scan.py's module docstring.
+
+on:
+  schedule:
+    - cron: "30 1,7,13,19 * * *"   # every 6 hours, offset 1.5h from scan.yml's :00 schedule
+  workflow_dispatch: {}
+
+concurrency:
+  group: company-scrapper-scan-osm
+  cancel-in-progress: false
+
+jobs:
+  scan-osm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: scanner-service
+        run: pip install -r requirements.txt
+
+      - name: Run OSM Overpass scan (bounded to ~5.5h, exits clean either way)
+        working-directory: scanner-service
+        env:
+          DATABASE_URL_1: ${{ secrets.DATABASE_URL_1 }}
+          DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
+          DATABASE_URL_3: ${{ secrets.DATABASE_URL_3 }}
+          DATABASE_URL_4: ${{ secrets.DATABASE_URL_4 }}
+          DATABASE_URL_5: ${{ secrets.DATABASE_URL_5 }}
+          MAX_RUNTIME_SECONDS: "19800"
+          OSM_TILE_DEG: "1"
+          OSM_SLEEP_BETWEEN_QUERIES: "2.0"
+        run: python osm_scan.py

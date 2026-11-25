@@ -350,6 +350,7 @@ def pg_upsert_businesses(pg, lookups, records):
             r.get("confidence"),
             lookups.statuses.get(norm(r.get("operating_status"))),
             r.get("lon"), r.get("lat"),
+            r.get("source") or "overture",
             now,
         ))
 
@@ -372,12 +373,17 @@ def pg_upsert_businesses(pg, lookups, records):
             # would be lost. PyMySQL's executemany rewrites a single
             # VALUES (...) statement into one real multi-row INSERT, the
             # same batching psycopg2.extras.execute_values gave on Postgres.
+            # source is likewise only ever set on first insert (ON DUPLICATE
+            # KEY UPDATE never touches it) — if Overture and OSM both find
+            # the same real-world business, whichever source got there
+            # first keeps credit, which is fine since source is "who told
+            # us about this row", not "who currently verifies it".
             cur.executemany("""
                 INSERT INTO businesses (
                     id, name, category_id, category_extra_id, address, location_id,
                     postcode, phone, website, email, social, brand_id, confidence,
-                    status_id, lon, lat, last_seen_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    status_id, lon, lat, source, last_seen_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)
             """, batch)
 
