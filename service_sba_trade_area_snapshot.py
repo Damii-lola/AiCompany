@@ -61,6 +61,7 @@ from datetime import datetime, timezone
 
 from service_lead_research_report import SpecError, _normalize_phone
 from service_business_enrichment import enrich_businesses, enrichment_summary
+from service_business_registry import enrich_with_registry, registry_summary
 
 # The live read API (render-service) — same URL the GitHub Pages
 # dashboard calls. Overridable per-call via spec["api_base"] for a local
@@ -219,12 +220,24 @@ def fulfil(spec: dict, out_dir: str) -> list:
     # docstring for the full cost reasoning. Disable per-call with
     # spec["enrich"] = False (e.g. for a fast preview-only run).
     enrichment_stats = None
+    registry_stats = None
     if spec.get("enrich", True):
         records = enrich_businesses(df.to_dict("records"))
         enrich_df = pd.json_normalize([r["enrichment"] for r in records], sep="_")
         enrich_df.columns = [f"enrich_{c}" for c in enrich_df.columns]
         df = pd.concat([df.reset_index(drop=True), enrich_df.reset_index(drop=True)], axis=1)
         enrichment_stats = enrichment_summary(records)
+
+        # Second, independent enrichment tier: real state Secretary-of-
+        # State registry cross-reference (legitimacy/status). Runs off
+        # the SAME `records` list (already has distance order + names),
+        # not `df`, since it only needs name/region, not the website
+        # fields the first pass just added.
+        registry_records = enrich_with_registry(records)
+        registry_df = pd.json_normalize([r["registry"] for r in registry_records], sep="_")
+        registry_df.columns = [f"registry_{c}" for c in registry_df.columns]
+        df = pd.concat([df.reset_index(drop=True), registry_df.reset_index(drop=True)], axis=1)
+        registry_stats = registry_summary(registry_records)
 
     no_website = df[df["website"].isna() | (df["website"].astype(str).str.strip() == "")]
     by_category = df["category"].value_counts()
@@ -238,7 +251,8 @@ def fulfil(spec: dict, out_dir: str) -> list:
                    "operating_status", "lat", "lon", "distance_miles",
                    "enrich_website_status", "enrich_hours_text", "enrich_price_range",
                    "enrich_rating_value", "enrich_review_count", "enrich_mobile_friendly",
-                   "enrich_social_links", "enrich_phone_confirmed"]
+                   "enrich_social_links", "enrich_phone_confirmed",
+                   "registry_matched", "registry_status_text", "registry_registry_name"]
     export_cols = [c for c in export_cols if c in df.columns]
 
     if "csv" in formats:
@@ -253,7 +267,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
     if "pdf" in formats:
         path = os.path.join(out_dir, f"trade_area_snapshot_{stamp}.pdf")
-        _write_pdf_snapshot(df, no_website, by_category, spec, result, path, enrichment_stats)
+        _write_pdf_snapshot(df, no_website, by_category, spec, result, path, enrichment_stats, registry_stats)
         files.append(path)
 
     manifest = {
@@ -268,6 +282,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
         # Real on-demand enrichment coverage — how many of the rows above
         # actually got a live website check this run, not guessed figures.
         "enrichment": enrichment_stats,
+        "registry_check": registry_stats,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "files": files,
     }
@@ -279,7 +294,8 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
 
 def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category: pd.Series,
-                         spec: dict, result: dict, path: str, enrichment_stats: dict = None):
+                         spec: dict, result: dict, path: str, enrichment_stats: dict = None,
+                         registry_stats: dict = None):
     """One-page trade-area snapshot: this is the document an SBA loan
     applicant or their lender actually reads, not the raw CSV."""
     from reportlab.lib.pagesizes import letter
@@ -318,6 +334,17 @@ def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category:
             + (f", avg rating {es['avg_rating_where_available']}/5 across "
                f"{es['rating_sample_size']} with a published rating" if es.get("avg_rating_where_available") else "")
             + f", {es['listings_with_hours_published']} publish real hours online.",
+            styles["Normal"],
+        ))
+        story.append(Spacer(1, 0.2 * inch))
+
+    if registry_stats and registry_stats.get("registry_checks_attempted"):
+        rs = registry_stats
+        story.append(Paragraph(
+            f"State registry check: {rs['states_with_registry_coverage']}/{rs['registry_checks_attempted']} "
+            f"competitors are in a state with registry coverage, {rs['confirmed_registered_entities']} "
+            f"confirmed as registered legal entities"
+            + (f" (statuses seen: {', '.join(rs['status_values_found'])})" if rs["status_values_found"] else "") + ".",
             styles["Normal"],
         ))
         story.append(Spacer(1, 0.2 * inch))

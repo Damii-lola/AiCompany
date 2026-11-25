@@ -61,7 +61,7 @@ def main():
                         "email": None, "social": None, "brand": None, "confidence": 0.9,
                         "operating_status": "open", "lon": -82.9988, "lat": 39.9615,
                         "distance_miles": 0.4,
-                    },
+                    },  # region OH has no wired-in state registry — exercises that honest path too
                     {
                         "id": "b2", "name": "No Site Dental", "category": "dental clinic",
                         "category_extra": None, "address": "2 Main St", "city": "Columbus",
@@ -88,6 +88,8 @@ def main():
             assert manifest["enrichment"]["websites_checked"] == 1
             assert manifest["enrichment"]["websites_reachable"] == 1
             assert manifest["enrichment"]["avg_rating_where_available"] == 4.8
+            assert manifest["registry_check"]["registry_checks_attempted"] == 2
+            assert manifest["registry_check"]["states_with_registry_coverage"] == 0  # OH not wired in
             print("PASS: fulfil() end-to-end — CSV/XLSX/PDF/manifest all written, "
                   "real enrichment data flowed through into the manifest")
 
