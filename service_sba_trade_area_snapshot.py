@@ -60,6 +60,7 @@ import pandas as pd
 from datetime import datetime, timezone
 
 from service_lead_research_report import SpecError, _normalize_phone
+from service_business_enrichment import enrich_businesses, enrichment_summary
 
 # The live read API (render-service) — same URL the GitHub Pages
 # dashboard calls. Overridable per-call via spec["api_base"] for a local
@@ -211,6 +212,20 @@ def fulfil(spec: dict, out_dir: str) -> list:
     df["distance_miles"] = df["distance_miles"].round(2)
     df = df.sort_values("distance_miles").reset_index(drop=True)
 
+    # On-demand enrichment — real website checks (schema.org hours/rating/
+    # price/social, reachability, mobile-friendliness), run ONLY for the
+    # businesses actually landing in this one report, never against the
+    # bulk 18.8M-row index. See service_business_enrichment.py's module
+    # docstring for the full cost reasoning. Disable per-call with
+    # spec["enrich"] = False (e.g. for a fast preview-only run).
+    enrichment_stats = None
+    if spec.get("enrich", True):
+        records = enrich_businesses(df.to_dict("records"))
+        enrich_df = pd.json_normalize([r["enrichment"] for r in records], sep="_")
+        enrich_df.columns = [f"enrich_{c}" for c in enrich_df.columns]
+        df = pd.concat([df.reset_index(drop=True), enrich_df.reset_index(drop=True)], axis=1)
+        enrichment_stats = enrichment_summary(records)
+
     no_website = df[df["website"].isna() | (df["website"].astype(str).str.strip() == "")]
     by_category = df["category"].value_counts()
 
@@ -220,7 +235,10 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
     export_cols = ["name", "category", "category_extra", "address", "city", "region",
                    "postcode", "country", "phone", "website", "email", "social", "brand",
-                   "operating_status", "lat", "lon", "distance_miles"]
+                   "operating_status", "lat", "lon", "distance_miles",
+                   "enrich_website_status", "enrich_hours_text", "enrich_price_range",
+                   "enrich_rating_value", "enrich_review_count", "enrich_mobile_friendly",
+                   "enrich_social_links", "enrich_phone_confirmed"]
     export_cols = [c for c in export_cols if c in df.columns]
 
     if "csv" in formats:
@@ -235,7 +253,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
     if "pdf" in formats:
         path = os.path.join(out_dir, f"trade_area_snapshot_{stamp}.pdf")
-        _write_pdf_snapshot(df, no_website, by_category, spec, result, path)
+        _write_pdf_snapshot(df, no_website, by_category, spec, result, path, enrichment_stats)
         files.append(path)
 
     manifest = {
@@ -247,6 +265,9 @@ def fulfil(spec: dict, out_dir: str) -> list:
         "no_website_pct": round(100 * len(no_website) / len(df), 1),
         "nearest_competitor_miles": float(df["distance_miles"].min()),
         "by_category": by_category.to_dict(),
+        # Real on-demand enrichment coverage — how many of the rows above
+        # actually got a live website check this run, not guessed figures.
+        "enrichment": enrichment_stats,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "files": files,
     }
@@ -258,7 +279,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
 
 def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category: pd.Series,
-                         spec: dict, result: dict, path: str):
+                         spec: dict, result: dict, path: str, enrichment_stats: dict = None):
     """One-page trade-area snapshot: this is the document an SBA loan
     applicant or their lender actually reads, not the raw CSV."""
     from reportlab.lib.pagesizes import letter
@@ -286,8 +307,22 @@ def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category:
         Paragraph(f"<b>{len(no_website)}</b> ({round(100*len(no_website)/len(df),1)}%) have no listed website",
                   styles["Normal"]),
         Paragraph(f"Nearest competitor: {df['distance_miles'].min():.2f} miles away", styles["Normal"]),
-        Spacer(1, 0.3 * inch),
+        Spacer(1, 0.2 * inch),
     ]
+
+    if enrichment_stats and enrichment_stats.get("websites_checked"):
+        es = enrichment_stats
+        story.append(Paragraph(
+            f"Live website check: {es['websites_reachable']}/{es['websites_checked']} competitor "
+            f"websites verified reachable this run"
+            + (f", avg rating {es['avg_rating_where_available']}/5 across "
+               f"{es['rating_sample_size']} with a published rating" if es.get("avg_rating_where_available") else "")
+            + f", {es['listings_with_hours_published']} publish real hours online.",
+            styles["Normal"],
+        ))
+        story.append(Spacer(1, 0.2 * inch))
+
+    story.append(Spacer(1, 0.1 * inch))
 
     rows = [["Category", "Count"]] + [[c, str(n)] for c, n in by_category.head(15).items()]
     t = Table(rows, colWidths=[3 * inch, 1.5 * inch])
