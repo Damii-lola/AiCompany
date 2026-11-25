@@ -1,12 +1,27 @@
 name: Company Scrapper scan
 
-# Runs the scanner in bounded windows instead of as one eternal process —
-# a GitHub Actions job hard-caps at 6 hours, so this is the "GitHub
-# Actions" deployment target scan_worker.py's MAX_RUNTIME_SECONDS was
-# built for: run for ~5.5h, exit clean, let the next scheduled trigger
-# pick back up. Nothing is lost between runs — progress lives in each
-# shard database's own scan_tiles table, not in this job's own disk,
-# which gets thrown away the moment it ends either way.
+# ONE unified scan — every discovery source runs under this single
+# workflow, not scattered across separately-named ones. Right now that's
+# Overture Maps (job: discover-overture) and OpenStreetMap Overpass (job:
+# discover-osm), both writing into the same TiDB shards' businesses
+# table, tagged by source ('overture' / 'osm' — see
+# database/schema.mysql.sql's businesses.source column). Any future bulk
+# discovery source (if one is added) gets a THIRD job in this same file,
+# not a new workflow — "the scan" means all of it, together.
+#
+# Each job is its own GitHub Actions job (not a single combined script)
+# because they're fundamentally different runtimes hitting fundamentally
+# different APIs — Overture is bulk columnar parquet reads via DuckDB,
+# OSM is serial, rate-limited HTTP calls to a shared public API that
+# must never be hit concurrently with itself. Running them as two jobs
+# under one workflow file means they execute AT THE SAME TIME (GitHub
+# Actions runs a workflow's jobs in parallel by default), on the same
+# schedule, shown together under one named run in the Actions tab —
+# "the scan" is one thing you trigger and watch, even though under the
+# hood it's two independent processes that would only get in each
+# other's way if forced into one sequential script (Overture's own
+# 5.5h runtime budget plus OSM's would blow well past GitHub's 6h job
+# cap if run one after the other in a single job).
 #
 # SHARDING: moved off Prisma Postgres to TiDB Cloud Starter — Prisma's
 # 2GB/workspace free-tier cap was already being exceeded by the live data,
@@ -14,20 +29,16 @@ name: Company Scrapper scan
 # out. TiDB Cloud Starter gives up to 5 free instances PER ACCOUNT (no
 # card needed), 5GiB storage + 50M request units/month each. The work is
 # split across as many free TiDB instances as you add here as
-# DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... secrets —
-# scan_worker.py discovers whichever numbered ones exist and scans all of
-# them AT THE SAME TIME (one thread per shard). Add every DATABASE_URL_N
-# secret you want BELOW in the env block (GitHub Actions doesn't support
-# wildcard secret passthrough, so each numbered one needs its own line
-# here) before the shard count you want is live, and apply
-# database/schema.mysql.sql to each new shard database by hand before
-# wiring up its secret, same one-time manual step as before. Leave the
-# shard count alone until a full pass finishes — see scan_worker.py's
-# module docstring for why.
+# DATABASE_URL_1, DATABASE_URL_2, DATABASE_URL_3, ... secrets — both jobs
+# below discover whichever numbered ones exist. Add every DATABASE_URL_N
+# secret you want in BOTH jobs' env blocks (GitHub Actions doesn't
+# support wildcard secret passthrough, so each numbered one needs its own
+# line, in both places) before the shard count you want is live, and
+# apply database/schema.mysql.sql to each new shard database by hand
+# before wiring up its secret, same one-time manual step as before.
 #
 # This repo is public, so these minutes are free and unlimited — no
-# billing setup needed anywhere for this, which is the whole reason this
-# replaced the Oracle VM plan.
+# billing setup needed anywhere for this.
 
 on:
   schedule:
@@ -40,7 +51,7 @@ concurrency:
                                 # fires while one's still going, it just waits
 
 jobs:
-  scan:
+  discover-overture:
     runs-on: ubuntu-latest
     timeout-minutes: 350       # hard safety net just under GitHub's 360-minute cap,
                                  # above MAX_RUNTIME_SECONDS below so the script's own
@@ -56,7 +67,7 @@ jobs:
         working-directory: scanner-service
         run: pip install -r requirements.txt
 
-      - name: Run scan (bounded to ~5.5h, exits clean either way)
+      - name: Run Overture scan (bounded to ~5.5h, exits clean either way)
         working-directory: scanner-service
         env:
           # Add one line per shard you've created — scan_worker.py picks
@@ -77,3 +88,34 @@ jobs:
           # shards at once; raise it back up if you're only running 1-2.
           DUCKDB_MEMORY_LIMIT: "1024MB"
         run: python scan_worker.py
+
+  discover-osm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: scanner-service
+        run: pip install -r requirements.txt
+
+      - name: Run OSM Overpass scan (bounded to ~5.5h, exits clean either way)
+        working-directory: scanner-service
+        env:
+          DATABASE_URL_1: ${{ secrets.DATABASE_URL_1 }}
+          DATABASE_URL_2: ${{ secrets.DATABASE_URL_2 }}
+          DATABASE_URL_3: ${{ secrets.DATABASE_URL_3 }}
+          DATABASE_URL_4: ${{ secrets.DATABASE_URL_4 }}
+          DATABASE_URL_5: ${{ secrets.DATABASE_URL_5 }}
+          MAX_RUNTIME_SECONDS: "19800"
+          OSM_TILE_DEG: "1"
+          # Deliberately slower than it could be — Overpass is a shared
+          # public resource, not a paid API we have a contract with, and
+          # this job's whole job is to be a polite, well-behaved citizen
+          # of it. Do not lower this without good reason.
+          OSM_SLEEP_BETWEEN_QUERIES: "2.0"
+        run: python osm_scan.py
