@@ -351,6 +351,7 @@ def pg_upsert_businesses(pg, lookups, records):
             lookups.statuses.get(norm(r.get("operating_status"))),
             r.get("lon"), r.get("lat"),
             r.get("source") or "overture",
+            r.get("basic_category"), r.get("category_hierarchy"),
             now,
         ))
 
@@ -382,8 +383,8 @@ def pg_upsert_businesses(pg, lookups, records):
                 INSERT INTO businesses (
                     id, name, category_id, category_extra_id, address, location_id,
                     postcode, phone, website, email, social, brand_id, confidence,
-                    status_id, lon, lat, source, last_seen_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    status_id, lon, lat, source, basic_category, category_hierarchy, last_seen_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE last_seen_at = VALUES(last_seen_at)
             """, batch)
 
@@ -603,6 +604,8 @@ def run_one_pass(release, shards, deadline=None):
       {_pick(cols, ("brand.names.primary", "brand"))} AS brand,
       {_pick(cols, ("confidence", "confidence"))} AS confidence,
       {_pick(cols, ("operating_status", "operating_status"))} AS operating_status,
+      {_pick(cols, ("basic_category", "basic_category"))} AS basic_category,
+      {_pick(cols, ("to_json(taxonomy.hierarchy)", "taxonomy"))} AS category_hierarchy,
       bbox.xmin AS lon,
       bbox.ymin AS lat
     """

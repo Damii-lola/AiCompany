@@ -90,6 +90,8 @@ def main():
             assert manifest["enrichment"]["avg_rating_where_available"] == 4.8
             assert manifest["registry_check"]["registry_checks_attempted"] == 2
             assert manifest["registry_check"]["states_with_registry_coverage"] == 0  # OH not wired in
+            cc = manifest["competitive_classification"]
+            assert cc["direct"] + cc["indirect"] + cc["related"] + cc["irrelevant"] + cc["unclassified"] == 2
             print("PASS: fulfil() end-to-end — CSV/XLSX/PDF/manifest all written, "
                   "real enrichment data flowed through into the manifest")
 

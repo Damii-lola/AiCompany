@@ -62,6 +62,7 @@ from datetime import datetime, timezone
 from service_lead_research_report import SpecError, _normalize_phone
 from service_business_enrichment import enrich_businesses, enrichment_summary
 from service_business_registry import enrich_with_registry, registry_summary
+from service_competitive_classifier import classify_businesses, classification_summary
 
 # The live read API (render-service) — same URL the GitHub Pages
 # dashboard calls. Overridable per-call via spec["api_base"] for a local
@@ -221,6 +222,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
     # spec["enrich"] = False (e.g. for a fast preview-only run).
     enrichment_stats = None
     registry_stats = None
+    classification_stats = None
     if spec.get("enrich", True):
         records = enrich_businesses(df.to_dict("records"))
         enrich_df = pd.json_normalize([r["enrichment"] for r in records], sep="_")
@@ -239,6 +241,21 @@ def fulfil(spec: dict, out_dir: str) -> list:
         df = pd.concat([df.reset_index(drop=True), registry_df.reset_index(drop=True)], axis=1)
         registry_stats = registry_summary(registry_records)
 
+        # Third tier: competitive classification (direct/indirect/related/
+        # irrelevant) against the category the customer actually searched
+        # — deterministic, grounded in Overture's own real taxonomy
+        # hierarchy when the scanned data has it, honestly falls back to
+        # leaf-category comparison when it doesn't. See
+        # service_competitive_classifier.py's module docstring for why
+        # this is a rule-based tier and not the trained worker-AI
+        # adapter the project reserves true subjective judgment calls for.
+        classified_records = classify_businesses(spec.get("category", ""), registry_records)
+        classification_df = pd.json_normalize(
+            [r["competitive_classification"] for r in classified_records], sep="_")
+        classification_df.columns = [f"classification_{c}" for c in classification_df.columns]
+        df = pd.concat([df.reset_index(drop=True), classification_df.reset_index(drop=True)], axis=1)
+        classification_stats = classification_summary(classified_records)
+
     no_website = df[df["website"].isna() | (df["website"].astype(str).str.strip() == "")]
     by_category = df["category"].value_counts()
 
@@ -252,7 +269,8 @@ def fulfil(spec: dict, out_dir: str) -> list:
                    "enrich_website_status", "enrich_hours_text", "enrich_price_range",
                    "enrich_rating_value", "enrich_review_count", "enrich_mobile_friendly",
                    "enrich_social_links", "enrich_phone_confirmed",
-                   "registry_matched", "registry_status_text", "registry_registry_name"]
+                   "registry_matched", "registry_status_text", "registry_registry_name",
+                   "classification_classification", "classification_basis"]
     export_cols = [c for c in export_cols if c in df.columns]
 
     if "csv" in formats:
@@ -267,7 +285,8 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
     if "pdf" in formats:
         path = os.path.join(out_dir, f"trade_area_snapshot_{stamp}.pdf")
-        _write_pdf_snapshot(df, no_website, by_category, spec, result, path, enrichment_stats, registry_stats)
+        _write_pdf_snapshot(df, no_website, by_category, spec, result, path,
+                            enrichment_stats, registry_stats, classification_stats)
         files.append(path)
 
     manifest = {
@@ -283,6 +302,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
         # actually got a live website check this run, not guessed figures.
         "enrichment": enrichment_stats,
         "registry_check": registry_stats,
+        "competitive_classification": classification_stats,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "files": files,
     }
@@ -295,7 +315,7 @@ def fulfil(spec: dict, out_dir: str) -> list:
 
 def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category: pd.Series,
                          spec: dict, result: dict, path: str, enrichment_stats: dict = None,
-                         registry_stats: dict = None):
+                         registry_stats: dict = None, classification_stats: dict = None):
     """One-page trade-area snapshot: this is the document an SBA loan
     applicant or their lender actually reads, not the raw CSV."""
     from reportlab.lib.pagesizes import letter
@@ -334,6 +354,19 @@ def _write_pdf_snapshot(df: pd.DataFrame, no_website: pd.DataFrame, by_category:
             + (f", avg rating {es['avg_rating_where_available']}/5 across "
                f"{es['rating_sample_size']} with a published rating" if es.get("avg_rating_where_available") else "")
             + f", {es['listings_with_hours_published']} publish real hours online.",
+            styles["Normal"],
+        ))
+        story.append(Spacer(1, 0.2 * inch))
+
+    if classification_stats and (classification_stats["direct"] or classification_stats["indirect"]
+                                  or classification_stats["related"]):
+        cs = classification_stats
+        story.append(Paragraph(
+            f"Competitive classification: {cs['direct']} direct competitor(s), "
+            f"{cs['indirect']} indirect, {cs['related']} related, {cs['irrelevant']} irrelevant "
+            f"(deterministic, based on Overture's own category taxonomy where available — "
+            f"{cs['classified_from_real_hierarchy_data']} of these used real hierarchy data, "
+            f"{cs['classified_from_leaf_category_fallback']} used the leaf-category fallback).",
             styles["Normal"],
         ))
         story.append(Spacer(1, 0.2 * inch))

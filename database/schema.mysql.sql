@@ -115,6 +115,23 @@ create table if not exists businesses (
   -- 'google_maps' (the self-hosted scraper, future). Doubles as the raw
   -- "Data source" field the SBA report spec's section 12 asks for.
   source            varchar(32) not null default 'overture',
+  -- Real structural category data straight from Overture's data, for the
+  -- on-demand competitive-classification enrichment tier (see
+  -- service_competitive_classifier.py). basic_category is Overture's own
+  -- single "cognitively natural" grouping label (e.g. 'casual_eatery');
+  -- category_hierarchy is the FULL general->specific taxonomy path as a
+  -- JSON array string (e.g. '["food_and_drink","restaurant",
+  -- "casual_eatery","gas_station_sushi"]'), straight from Overture's
+  -- `taxonomy.hierarchy` field (confirmed real, current Overture Places
+  -- schema field — docs.overturemaps.org/schema/reference/places/types/
+  -- taxonomy/). TEXT, not a fixed-length type: a JSON array has no fixed
+  -- byte cap, same reasoning as website/address above. Both NULL for any
+  -- row scanned before this column existed, and for OSM rows (OSM tags
+  -- have no equivalent taxonomy concept) — the classifier is built to
+  -- fall back honestly to leaf-category-only comparison when these are
+  -- absent, never to guess a hierarchy that was never actually scanned.
+  basic_category    varchar(128),
+  category_hierarchy text,
   -- VIRTUAL, not STORED: TiDB does not support adding a STORED generated
   -- column via ALTER TABLE at all (only at CREATE TABLE time), which a
   -- real live shard hit when widening `website` to TEXT required
@@ -161,6 +178,7 @@ create or replace view businesses_readable as
     b.lon, b.lat,
     b.has_website,
     b.source,
+    b.basic_category, b.category_hierarchy,
     b.first_seen_at, b.last_seen_at
   from businesses b
   left join categories c1 on c1.id = b.category_id
