@@ -437,6 +437,24 @@ def _pick(cols, *candidates):
     return "NULL"
 
 
+# MySQL/TiDB error codes that mean "the database schema itself doesn't
+# match what this code expects" — never transient, never fixed by
+# retrying or splitting a region smaller. 1054 = Unknown column, 1146 =
+# table doesn't exist, 1049 = unknown database (e.g. a secret still
+# pointing at the wrong database name — the exact /sys-vs-company_scrapper
+# mistake hit earlier in this project's live deployment).
+_SCHEMA_MISMATCH_ERRNOS = {1054, 1146, 1049}
+
+
+def _is_schema_mismatch_error(e: Exception) -> bool:
+    if isinstance(e, pymysql.MySQLError) and e.args:
+        try:
+            return int(e.args[0]) in _SCHEMA_MISMATCH_ERRNOS
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
 def scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1, depth=0):
     """Queries one lon/lat bounding box, restricted to country='US' so we
     never pull (and never store) non-US places that happen to fall inside
@@ -481,6 +499,29 @@ def scan_region(con, pg, lookups, select, cols, x0, y0, x1, y1, depth=0):
             pg_upsert_businesses(pg, lookups, records)
         return n
     except Exception as e:
+        # A real incident caught live (Nov 2026): a schema change
+        # (adding businesses.basic_category/category_hierarchy) shipped
+        # before all live shards had the ALTER TABLE applied — every
+        # single tile failed with "Unknown column 'basic_category'", and
+        # this function's split-and-retry logic (correctly designed for
+        # TRANSIENT failures like an OOM on a dense region, where a
+        # smaller bbox genuinely has a better chance) instead spent the
+        # entire ~5.5h scheduled run quartering every tile down to its
+        # smallest split size and failing identically at every depth —
+        # a schema mismatch fails the exact same way no matter how small
+        # the region is, so splitting can never help it. Fail the WHOLE
+        # run immediately and loudly for this error class instead of
+        # burning the scheduled window finding that out one tile at a
+        # time.
+        if _is_schema_mismatch_error(e):
+            raise RuntimeError(
+                f"Schema mismatch against this shard's database: {e}. This is NOT a "
+                f"transient per-region failure — splitting into smaller regions cannot "
+                f"fix a missing/renamed column, so this run is aborting immediately "
+                f"instead of burning its whole time budget re-discovering this on every "
+                f"tile. Apply the missing schema change (see database/schema.mysql.sql) "
+                f"to this shard's database, then re-run."
+            ) from e
         width = x1 - x0
         if depth >= MAX_SPLIT_DEPTH or width <= MIN_SPLIT_DEG:
             print(f"    region ({x0:.3f},{y0:.3f})-({x1:.3f},{y1:.3f}) still failing at the smallest "
