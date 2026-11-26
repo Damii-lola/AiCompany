@@ -70,6 +70,7 @@ import argparse
 import requests
 
 import service_sba_trade_area_snapshot as sba
+from service_lead_research_report import SpecError
 
 # The live read API (render-service) — same URL the GitHub Pages dashboard
 # and service_sba_trade_area_snapshot.py's own default call. Sharded behind
@@ -382,12 +383,29 @@ def main():
         print("No request given — pass it as a CLI argument, or set RESEARCH_REQUEST.")
         sys.exit(1)
 
-    result = research(
-        nl_request,
-        output_formats=[f.strip() for f in args.formats.split(",") if f.strip()],
-        out_dir=args.out_dir,
-        api_base=args.api_base,
-    )
+    try:
+        result = research(
+            nl_request,
+            output_formats=[f.strip() for f in args.formats.split(",") if f.strip()],
+            out_dir=args.out_dir,
+            api_base=args.api_base,
+        )
+    except (SpecError, ValueError) as e:
+        # Every realistic failure here (bad/unmatched address, category
+        # that doesn't match any real category, live API unreachable, a
+        # spec that's too narrow) already raises a clean, specific,
+        # human-readable message — this is the restored research.yml's
+        # whole point of existing: the person running it from the Actions
+        # tab isn't a developer and shouldn't have to read a Python
+        # traceback to find the one sentence that tells them what to
+        # change. Still exits non-zero so the Actions run correctly shows
+        # as failed either way.
+        print(f"\nCould not complete this request: {e}")
+        sys.exit(1)
+    except requests.exceptions.RequestException as e:
+        print(f"\nA real network request failed (not a bug in the request itself): {e}")
+        sys.exit(1)
+
     print("\n" + json.dumps(
         {"spec": result["spec"], "preview": result["preview"], "files": result["files"]},
         indent=2, default=str,

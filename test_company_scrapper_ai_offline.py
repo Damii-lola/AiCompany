@@ -185,10 +185,41 @@ def test_research_end_to_end_with_mocked_render_service():
     shutil.rmtree(out_dir, ignore_errors=True)
 
 
+def test_main_reports_real_failures_cleanly_not_as_a_traceback():
+    # research.yml's whole point is to be usable by someone who isn't a
+    # developer and will only ever look at the Actions log — an
+    # unhandled exception there is a wall of Python they can't act on.
+    # A request research() genuinely can't satisfy (ValueError: no
+    # address at all) must still exit non-zero (the Action correctly
+    # shows failed) but print one plain sentence, not a traceback.
+    import subprocess
+    result = subprocess.run(
+        [sys.executable, "company_scrapper_ai.py", "find businesses"],
+        cwd=os.path.dirname(os.path.abspath(__file__)) or ".",
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 1, result
+    assert "Traceback" not in result.stdout and "Traceback" not in result.stderr, (result.stdout, result.stderr)
+    # This sandbox can't reach the real render-service at all (no network
+    # path to aicompany-tmg7.onrender.com), so "find businesses" with no
+    # address fails here via the RequestException branch instead of the
+    # ValueError-no-address branch it'd hit against the real live API —
+    # both are legitimate clean-failure outcomes of the same try/except;
+    # accept either rather than assuming which one fires in a given
+    # environment.
+    assert ("Could not complete this request" in result.stdout
+            or "A real network request failed" in result.stdout), result.stdout
+    print("PASS: a request main() genuinely can't satisfy exits non-zero with one "
+          "plain, actionable sentence — no Python traceback dumped to the Actions log")
+
+
 if __name__ == "__main__":
+    import sys
     test_category_matching_exact_and_fuzzy()
     test_category_matching_never_confuses_similar_length_phrases()
     test_parse_request_extracts_all_fields()
     test_parse_request_missing_address_is_honest()
+    test_profession_synonyms_resolve_to_real_categories()
     test_research_end_to_end_with_mocked_render_service()
+    test_main_reports_real_failures_cleanly_not_as_a_traceback()
     print("\nALL COMPANY SCRAPPER AI OFFLINE TESTS PASSED")
