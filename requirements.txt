@@ -1,0 +1,11 @@
+# Root-level requirements for the SBA trade-area report pipeline
+# (company_scrapper_ai.py + service_sba_trade_area_snapshot.py +
+# service_business_enrichment.py + service_business_registry.py +
+# service_competitive_classifier.py). Separate from
+# scanner-service/requirements.txt (the bulk discovery scanners have
+# their own, different dependency set — DuckDB/PyMySQL, no pandas/
+# reportlab needed there).
+requests>=2.32.0
+pandas>=2.2.0
+reportlab>=4.2.0
+openpyxl>=3.1.0

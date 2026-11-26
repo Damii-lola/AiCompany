@@ -1,0 +1,72 @@
+name: Company Scrapper research request
+
+# Restores a real, live-reachable way to actually GENERATE an SBA trade-
+# area report — without this, every enrichment tier built this session
+# (website/schema.org checks, state registry cross-reference, competitive
+# classification) has no path a person can actually trigger: there is no
+# live chat endpoint anymore (deliberately removed — see project memory,
+# "no more ai chatbot"), and docs/index.html is still the bare
+# placeholder page pending a new UI spec. This workflow is the interim
+# front door: fill in the form on the Actions tab, run it, download the
+# real CSV/XLSX/PDF from the run's artifact when it finishes — same
+# pattern as the original research.yml this repo had before the live
+# chat path briefly replaced it (see company_scrapper_ai.py's own module
+# docstring for that history), rebuilt here because that live path was
+# later deleted entirely and nothing replaced it as the way to actually
+# run a report.
+#
+# This repo is public, so these minutes are free and unlimited, same as
+# scan.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: >-
+          Plain-English research request, e.g. "find dental clinics with
+          no website within 3 miles of 123 Main St, Columbus, OH"
+        required: true
+        type: string
+      formats:
+        description: "Comma-separated output formats to generate"
+        required: false
+        type: choice
+        default: "csv,pdf"
+        options:
+          - "csv,pdf"
+          - "csv"
+          - "pdf"
+          - "xlsx"
+          - "csv,xlsx,pdf"
+
+jobs:
+  research:
+    runs-on: ubuntu-latest
+    # A single report's enrichment pass (website checks + state-registry
+    # cross-reference, both bounded at ~150s each — see
+    # service_business_enrichment.py / service_business_registry.py) plus
+    # geocoding and file writing is a few minutes at the very most; this
+    # is a generous ceiling, not an expected runtime.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the research request
+        env:
+          RESEARCH_REQUEST: ${{ inputs.request }}
+        run: python company_scrapper_ai.py --formats "${{ inputs.formats }}" --out-dir ./company_scrapper_out
+
+      - name: Upload report files
+        uses: actions/upload-artifact@v4
+        with:
+          name: sba-trade-area-report
+          path: company_scrapper_out/
+          if-no-files-found: error
+          retention-days: 30

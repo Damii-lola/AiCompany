@@ -133,6 +133,43 @@ def _category_score(term: str, norm_cat: str) -> float:
     return max(jaccard * 0.85, char_ratio * 0.5)
 
 
+# Real gap this closes: word-identity-first scoring (by design — see
+# _category_score's docstring) correctly refuses to match unrelated
+# same-length phrases, but that same strictness means a profession name
+# that shares NO root word with its own business-type category genuinely
+# scores below min_score and fails outright ("dentist" vs "dental_clinic"
+# scores 0.25, found and confirmed while adding test coverage for the
+# restored research.yml entry point — a customer typing the single most
+# natural way to ask for this would get a hard "could not match"
+# rejection). This isn't a scoring-algorithm bug to patch around; it's a
+# real, common-English synonym gap, so the fix is a real, explicit
+# synonym list — not a scoring hack — covering the classic English
+# pattern where a profession/person title differs from its business-type
+# noun. Expand from here if real use surfaces more (that's the documented
+# standard for reconsidering anything in this file — see module
+# docstring). Keys are checked as whole-term or whole-word matches only,
+# never substrings, so this can't silently misfire on an unrelated phrase
+# that happens to contain one of these words.
+PROFESSION_SYNONYMS = {
+    "dentist": "dental clinic", "dentists": "dental clinic",
+    "lawyer": "law firm", "lawyers": "law firm", "attorney": "law firm", "attorneys": "law firm",
+    "vet": "veterinarian", "vets": "veterinarian",
+    "accountant": "accounting firm", "accountants": "accounting firm",
+    "bookkeeper": "accounting firm", "cpa": "accounting firm",
+    "mechanic": "auto repair shop", "mechanics": "auto repair shop",
+    "hairdresser": "hair salon", "hairdressers": "hair salon", "stylist": "hair salon",
+    "doctor": "medical clinic", "doctors": "medical clinic", "physician": "medical clinic",
+    "optometrist": "eye care center", "eye doctor": "eye care center",
+    "pharmacist": "pharmacy",
+}
+
+
+def _expand_synonyms(term: str) -> str:
+    """Returns the synonym expansion for an exact whole-term match, or
+    the term unchanged if it isn't one — never a partial/substring swap."""
+    return PROFESSION_SYNONYMS.get(term.strip().lower(), term)
+
+
 def match_categories(plain_english_term, real_categories, top_k=3, min_score=0.45):
     """Maps what a user actually says ('dentist', 'coffee shop') to the
     REAL category strings in the database — purely deterministic (no
@@ -148,8 +185,13 @@ def match_categories(plain_english_term, real_categories, top_k=3, min_score=0.4
     term = (plain_english_term or "").strip().lower()
     if not term:
         return []
+    expanded_term = _expand_synonyms(term)
 
-    scored = [(_category_score(term, cat.replace("_", " ").lower()), cat) for cat in real_categories]
+    scored = [
+        (max(_category_score(term, norm_cat), _category_score(expanded_term, norm_cat)), cat)
+        for cat in real_categories
+        for norm_cat in (cat.replace("_", " ").lower(),)
+    ]
     scored = [(s, c) for s, c in scored if s >= min_score]
     if not scored:
         return []
@@ -228,7 +270,11 @@ def _split_category_and_address(text, real_categories):
             window = " ".join(words[i:i + size]).strip(" ,.").lower()
             if not window:
                 continue
-            best_for_window = max((_category_score(window, nc) for nc in norm_cats), default=0.0)
+            expanded_window = _expand_synonyms(window)
+            best_for_window = max(
+                (max(_category_score(window, nc), _category_score(expanded_window, nc)) for nc in norm_cats),
+                default=0.0,
+            )
             # Slight bonus for longer windows at an equal score — prefer
             # "coffee shop" over just "coffee" when both score the same.
             score = best_for_window + size * 0.001
